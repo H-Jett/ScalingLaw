@@ -1,0 +1,12 @@
+# ---- 生成物(体积大或可复现, 不入库) ----
+models/                 # gen_model.py 生成的各尺寸模型目录(config+tokenizer, 无权重)
+logs/                   # 训练日志
+outputs/
+saves/
+data/*
+!data/dataset_info.json # 语料配置要入库, 语料本体不入库
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/

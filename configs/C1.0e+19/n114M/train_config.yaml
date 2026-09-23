@@ -1,0 +1,37 @@
+### Chinchilla isoFLOP 实验单元 —— 由 make_grid.py 生成, 勿手改
+### 注意: 改动 max_steps 会同时改变 cosine 周期长度, 破坏论文 App. B 的要求
+model_name_or_path: /volume/data/hjiang02/workspace/ScalingLaw/models/n114M
+trust_remote_code: true
+train_from_scratch: true       # 关键: 从 config 随机初始化, 不加载权重
+
+### method
+stage: pt
+do_train: true
+finetuning_type: full
+
+### dataset
+dataset: chinchilla_corpus
+dataset_dir: data
+template: default
+cutoff_len: 2048
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: /volume/data/hjiang02/workspace/ScalingLaw/configs/C1.0e+19/n114M/output
+overwrite_output_dir: true
+report_to: none
+logging_steps: 10
+save_strategy: "no"            # 中间 checkpoint 对缩放律无用, 省磁盘
+plot_loss: false
+
+### train
+per_device_train_batch_size: 32
+gradient_accumulation_steps: 1
+learning_rate: 0.0001
+lr_scheduler_type: cosine      # 周期 = max_steps, 必须与 D 匹配
+warmup_steps: 2238
+max_steps: 223819
+bf16: true
+gradient_checkpointing: true   # 长序列省显存
+ddp_timeout: 180000000
