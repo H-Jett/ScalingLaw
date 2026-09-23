@@ -3,8 +3,10 @@
 复现 Hoffmann et al. 2022《Training Compute-Optimal Large Language Models》(arXiv:2203.15556)
 的**核心方法论**——用 isoFLOP 剖面测出 `N_opt ∝ C^a`、`D_opt ∝ C^b`，检验 `a ≈ b ≈ 0.5`。
 
-模型架构用 **GPT-NeoX**（对齐 Pythia 系列），底座 `EleutherAI/pythia-14m` 仅取其 **tokenizer**，
-尺寸通过 config 调整——每个尺寸一份 `config.json`，配 `train_from_scratch: true` 从零初始化。
+模型架构用 **GPT-NeoX**(对齐 Pythia 系列)，**以 `EleutherAI/pythia-14m` 为模板**：只取其
+config + tokenizer，尺寸通过改 4 个字段往上派生，配 `train_from_scratch: true` 从零初始化。
+选 Pythia 作模板不是为了"复现 Pythia"，而是因为它是这批模型里**唯一有官方公开权重和完整
+训练曲线**的家族，可以拿来做独立交叉验证。
 
 ## 0. 先明确这个计划能给什么、不能给什么
 
@@ -16,57 +18,72 @@
 **不能给：**
 - 论文的绝对 loss 数值 —— MassiveText **未公开**，不可复现。论文模型卡原文：
   "Primary Intended Users: DeepMind researchers. **We will not make this model available publicly.**"
-- 论文原样的 20 tok/param 常数 —— tokenizer（vocab 32k BPE 无 NFKC vs Pythia 的 50304）改变了
-  每 token 的信息量，即改变了有效 D。
+- 论文原样的 20 tok/param 常数 —— 换了 tokenizer(vocab 50304 = Pythia 口径)就改变了每 token
+  的信息量，即改变了有效 `D`
 
-## 1. 已实测的环境事实（2026-09-23）
+**关键推论**：既然绝对数值注定对不上，架构上追求"忠实于 Gopher/Chinchilla"就买不到可比性。
+且指数对架构是弱敏感的（论文 App. C 演示了跨数据集指数几乎不动）。**所以架构选型是工程
+效率问题，不是保真度问题。**
+
+## 1. 环境事实（2026-09-23 实测）
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| GPU | 2 × H200 (sm90, 143GB) | nvidia-smi |
-| torch | 2.8.0+cu128 | 实测 |
-| 实测吞吐 | **1.07B 模型 / batch 32 → 44.6K tok/s ≈ 286 TFLOPS = 29% MFU** | 本机 50 步实测 |
-| GPU 时价折算 | 20 单元 isoFLOP 单遍 ≈ **44 天**（单卡）；加超参候选 ≈ 70 天 | 算自 1.10e21 FLOPs |
+| GPU | **4 × H100 80GB** (HBM3) | `nvidia-smi` |
+| 系统 python | `/usr/bin/python3` = 3.12 + torch 2.6.0+cu124 + transformers 4.51.3 | 实测（**不要动，另建环境**） |
+| conda | `/opt/miniconda3`（新建）+ 环境 `scalinglaw`，见 §8 | 见 §8 |
+| ⚠️ `/volume/data` | **配额已满，仅剩 ~776M**，写 1GB 在 700M 处报 `Disk quota exceeded` | 实测 |
+| `/` (overlay) | ~247G 可用，**但容器重建即丢** | `df -h` |
 
-⚠️ **注意力实现的坑**：`GPTNeoX` 在 transformers 5.8.0 里 **不支持 FlashAttention-2**
-（`_supports_flash_attn_2` 未定义），只支持 SDPA / flex_attn。所以：
-- 我们装的 flash-attn 2.8.3 **对本实验用不上**（对 LLaMA 架构仍有用）
-- 29% MFU 就是 SDPA 下的实测值；若追求更高吞吐，需换架构或上 flex_attn
+⚠️ **注意力实现**：`GPTNeoX` 在 **transformers 4.51.3 里 `_supports_flash_attn_2 = True`**
+（旧版本 5.8.0 下不声明支持，那是版本特性，不是架构限制）。是否真的能跑 FA2 需在
+`scalinglaw` 环境里实测；`_supports_flex_attn` 也在。**当前 MFU 未知**，需复测。
 
-## 2. 尺寸阶梯（Chinchilla Table A9）
+## 2. 模型尺寸阶梯
 
-论文 Table A9 的规律：`ffw = 4 × d_model`，`n_heads × head_dim = d_model`。
+由 `scripts/make_model_ladder.py` 从 pythia-14m 模板派生，**第 1 档就是模板本身**（原样保留，
+它是长宽比律的锚点，也是唯一能对官方曲线做交叉验证的尺寸）。
 
-⚠️ **A9 的 "Parameters (million)" 列与 HF 口径对不上**（A9 的 74M 行按 HF 算实为 113.6M）。
-下表一律用 HF 口径（`12Ld² + 2·vocab·d + 13Ld`，vocab=50304），已用 LLaMA-Factory
-实际报的 `1,067,137,792` 验证过一致。
+| 目录 | d_model | L | heads | head_dim | ffw | N_非emb | N_总 | emb占比 |
+|---|---|---|---|---|---|---|---|---|
+| `pythia-14m` | 128 | 6 | 4 | 32 | 512 | 1.2M | 14.1M | 91.5% |
+| `pythia-23m` | 192 | 8 | 6 | 32 | 768 | 3.6M | 22.9M | 84.4% |
+| `pythia-43m` | 320 | 9 | 10 | 32 | 1280 | 11.1M | 43.3M | 74.4% |
+| `pythia-86m` | 512 | 11 | 16 | 32 | 2048 | 34.7M | 86.2M | 59.8% |
+| `pythia-184m` | 768 | 15 | 12 | 64 | 3072 | 106.3M | 183.6M | 42.1% |
+| `pythia-442m` | 1216 | 18 | 19 | 64 | 4864 | 319.7M | 442.0M | 27.7% |
+| `pythia-1.2b` | 1920 | 23 | 15 | 128 | 7680 | 1.02B | 1.21B | 15.9% |
 
-| 名称 | d_model | L | heads | head_dim | ffw | 参数量 |
-|---|---|---|---|---|---|---|
-| n114M | 640 | 10 | 10 | 64 | 2560 | 113.6M |
-| n205M | 768 | 18 | 12 | 64 | 3072 | 204.8M |
-| n355M | 1024 | 20 | 16 | 64 | 4096 | 354.9M |
-| n542M | 1280 | 21 | 10 | 128 | 5120 | 542.0M |
-| n1067M | 1792 | 23 | 14 | 128 | 7168 | 1067.1M |
-| n1470M | 2176 | 22 | 17 | 128 | 8704 | 1469.6M |
-| n2303M | 2560 | 26 | 20 | 128 | 10240 | 2303.1M |
+**完整尺寸表 + 设计规则见 `models/configs/README.md`（脚本自动生成）。** 要点：
 
-## 3. 训练网格
+1. **骨架公式**（已对 pythia 官方 9 档校验，误差 0）：
+   `N_非emb = 12·L·d² + 13·L·d + 2·d`，`N_总 = N_非emb + 2·vocab·d`
+2. **长宽比律**：`L ∝ d^0.5`（等价 `d ∝ N^0.4, L ∝ N^0.2`）。放大模型主要靠放大 `d`
+   （平方项），但 `d` 和 `L` 必须一起长
+3. **离散约束**：`d` 为 64 的倍数、`head_dim = clamp(≥d/16 的最小 2 的幂, 32, 128)`、
+   `ffw = 4·d`。量化后**不可能同时精确命中参数量和理想长宽比**，脚本用
+   `|log(N/N_target)| + λ·|log(L/L_ideal)|` 折中，表里两个偏差都列出来
+4. ⚠️ **口径**：目录名用**总参数量**（pythia/HF 命名口径），阶梯按**非 embedding**参数量定。
+   这个区分必须记住 —— `pythia-14m` 名义 14M，但其中 12.9M 是词表，计算层只有 1.2M
 
-`N_opt = √(C/120)`（20 tok/param 锚点下 `C = 6ND` 且 `D = 20N` ⇒ `C = 120N²`）。
-每个预算取其最近的 5 个尺寸，**必须跨过 N_opt 两侧**（否则抛物线拟合没有顶点）。
+## 3. 实验网格（待定稿）
 
-| 预算 C | N_opt | 尺寸阶梯（参数） | 该阶梯 tok/param 范围 |
-|---|---|---|---|
-| 1.0e19 | 289M | 114M / 205M / 355M / 542M / 1067M | 129 → 1.5 |
-| 3.0e19 | 500M | 205M / 355M / 542M / 1067M / 1470M | 119 → 2.3 |
-| 6.0e19 | 707M | 355M / 542M / 1067M / 1470M / 2303M | 79 → 1.9 |
-| 1.2e20 | 1000M | 355M / 542M / 1067M / 1470M / 2303M | 159 → 3.8 |
+isoFLOP 剖面法的要求：每个预算 `C` 下扫一串尺寸，**必须有一个尺寸落在 `N_opt` 两侧**
+（否则抛物线没有顶点，测不出最优点）。
 
-共 **20 个实验单元**，单遍开销 **1.10e21 FLOPs**（= 4 个预算之和 × 各自 5 个尺寸）。
+上一版网格（Chinchilla Table A9 尺寸梯）已废弃，因为 A9 的尺寸与我们这条 pythia 阶梯无关。
+**新版网格待定**，需要：
+- 选定 3~4 个 isoFLOP 预算 `C`
+- 每个 `C` 从 §2 的 7 档里挑 4~5 档，保证跨过 `N_opt = √(C/120)` 两侧
+- token 数由 `D = C/(6N)` 反推，**cosine 周期长度必须精确等于 `max_steps`**
+  （论文 App. B：超出 25% 性能明显下降）
 
-> 若后续要加第 5 个预算 3e20（N_opt=1.6B），因为 `D` 超 100BT（需 2.5e11 token）必须先用
-> `sample/350BT` 扩语料，且单遍开销会涨到 ~2.6e21。
+⚠️ 注意 `N` 的口径与 §2 一致（建议用 `N_总`，因为 `C = 6ND` 的 `C` 是含 embedding 的算力；
+论文原文："We include all training FLOPs, including those contributed to by the embedding
+matrices" 以及 "we also count embeddings matrices in the total parameter count"）。
+但我们 vocab 是 50304（比论文 32k 大 1.57 倍），小模型端 embedding 占比会到 74~92%，
+论文"embedding 贡献很小"的前提在小端**不成立** —— 这里要做敏感性分析：两个口径各算一遍，
+看谷底位置移动多少。
 
 ## 4. 数据
 
@@ -77,43 +94,46 @@
 **只要训练不超过 1 个 epoch，缩放律与数据集无关。**
 
 100BT 是**单次 run** 的上限（超过 1 epoch 就要引入 datablock 的重复数据修正），
-多个 run 可以复用同一份语料。上表最大 token 需求 56.35B，留有充足余量。
+多个 run 可以复用同一份语料。
 
-token 数按 `D = C/6N` 反推，cosine 周期长度**必须精确等于 max_steps**（论文 App. B：
-超出 25% 性能明显下降）。`make_grid.py` 据此生成 `max_steps`。
+⚠️ **磁盘**：tokenized 语料的体积是几百 GB 量级，当前 `/volume/data` 配额已满，**阶段 0 之前
+必须先解决**（申请配额 / 清理 / 换存储）。
 
 ## 5. 实施步骤
 
-### 阶段 0：语料准备（~0.5 天）
-```bash
-export HF_HOME=/volume/data/hjiang02/.cache/huggingface
-# 下 fineweb-edu sample/100BT，转成 LLaMA-Factory 的 pt 格式（text 字段），落 /volume/data
-```
-产出 `data/chinchilla_corpus/` + `dataset_info.json` 条目 `chinchilla_corpus`（columns: prompt←text）。
+### 阶段 0：环境 + 语料（~1 天）
+- miniconda + `scalinglaw` 环境（见 §8）
+- 下 fineweb-edu `sample/100BT`，转成 LLaMA-Factory 的 pt 格式（text 字段）
+- 产出 `data/chinchilla_corpus/` + `dataset_info.json` 条目
 
 ### 阶段 1：小预算先验证闭环（1 个单元，~1 天）
-只跑 `C=1e19 × n355M`（最接近 N_opt 的点，D=4.7e9 tokens）。目的：
+只跑一个小单元（比如 `pythia-86m` 或 `pythia-184m`）。目的：
 - 确认 `train_from_scratch` 路径、tokenizer/packing、loss 曲线形状正常
-- 校准实际吞吐与显存，修正阶段 2 的 batch 设定
-**不要跳过**——这是唯一能低成本发现配置错误的机会。
+- **复测吞吐与 MFU**（旧记录 286 TFLOPS/29% 是在 2×H200 + transformers 5.8 上测的，已失效），
+  据此修正阶段 2 的 batch 设定
+- 顺便用 `pythia-14m` 这一档对齐官方曲线，验证实现正确性
+**不要跳过。**
 
 ### 阶段 2：**按尺寸调 batch / LR / β2**（~1 周）⚠️ 不可跳过
 
-**这是整个计划最容易失败的地方。** 论文没有公布每个尺寸的 LR/batch/β2
-（grep 过全文，App. D.1 只给了 max LR 区间 2e-4 小 → 1.25e-4 大，App. D.4 给了对照实验的
-0.5M token batch / 1.5e-4 LR）。Porian et al. 2024 (arXiv:2406.19146) 的实测结论：
+**这是整个计划最容易失败的地方。** 论文没有公布每个尺寸的 LR/batch/β2（App. D.1 只给了
+max LR 区间 2e-4 小 → 1.25e-4 大）。Porian et al. 2024 (arXiv:2406.19146) 的实测结论：
 **小尺度上若不按尺寸调这三项，拟合出的 `a` 会系统性偏大到 0.6~0.9，复现不出 0.5。**
 
-要调的（对每个尺寸，用 1e19 预算下的 D 短跑几个点）：
+要调的（对每个尺寸，用最短的预算短跑几个点）：
 - **batch size（按 token 计）**：随模型增大而增大
 - **max LR**：经验上 `LR ∝ 1/width`；起点用论文区间，在各自尺寸上扫 3 个值
 - **AdamW β2**：Porian 指出 β2=0.95 在小 batch(≤128) 下不是最优，**要用 0.99/0.999**
 - **grad clip 1.0**（论文 Gopher §3.2；7.1B 以上降到 0.25）
-- warmup：论文用固定 1500 步；Porian 建议 warmup tokens ≈ N，小模型上按后者更稳
+- **warmup**：论文用固定 1500 步；Porian 建议 warmup tokens ≈ N，小模型上按后者更稳
+- ⚠️ **初始化**：HF 的 `GPTNeoXPreTrainedModel._init_weights` 对**所有尺寸**都用固定
+  `initializer_range=0.02`，**没有** EleutherAI 原实现里 `1/√(2L)` 的残差输出缩放。
+  含义：① 大 `L` 档若 loss 一开头就炸，先怀疑 init 而不是自己写错了；② 在 HF 里
+  from-scratch 训出来的模型与 pythia 官方权重**不是同一套 init 方案**，交叉验证要留这个偏差
 
-### 阶段 3：跑满 20 个单元（随预算）
-`make_grid.py` 生成配置后逐个跑。**每跑完一个尺寸就立刻拟合抛物线**，不要等全部跑完
-——如果发现某条曲线没有顶点（阶梯没跨过最优点），要能及时补点而不是返工。
+### 阶段 3：跑满网格（随预算）
+生成配置后逐个跑。**每跑完一个尺寸就立刻拟合抛物线**，不要等全部跑完——如果发现某条曲线
+没有顶点（阶梯没跨过最优点），要能及时补点而不是返工。
 
 ### 阶段 4：拟合与对照（~2 天）
 - 每条 isoFLOP 曲线拟合抛物线 → 顶点即 `N_opt(C)`、`D_opt(C)`
@@ -135,31 +155,41 @@ export HF_HOME=/volume/data/hjiang02/.cache/huggingface
 ## 7. 目录结构
 
 ```
-Chinchilla-Scaling-Law/
-  PLAN.md                     # 本文件
+ScalingLaw/
+  PLAN.md                       # 本文件
   scripts/
-    gen_model.py              # 按 Table A9 规格生成 GPT-NeoX 模型目录(config+tokenizer, 无权重)
-    make_grid.py              # 生成模型目录 + 训练 YAML + 清单 reports/grid.json
-    run_grid.py               # (阶段 3 再写) 批量执行 + 断点续跑
-    fit_scaling.py            # (阶段 4 再写) 抛物线拟合 + 幂律拟合
-  configs/                    # 由 make_grid.py 生成的训练配置
-  models/                     # 由 make_grid.py 生成的各尺寸模型目录
-  data/                       # 语料(符号链接到 /volume/data 下的实际存放处)
-  logs/                       # 训练日志
-  reports/                    # grid.json、拟合结果(带时间戳)
+    make_model_ladder.py        # 从 pythia-14m 模板派生尺寸阶梯(config+tokenizer, 无权重)
+    # run_grid.py               # (阶段 3 再写) 批量执行 + 断点续跑
+    # fit_scaling.py            # (阶段 4 再写) 抛物线拟合 + 幂律拟合
+  models/
+    templates/pythia-14m/       # 下载的官方模板(尺寸设计的锚点)
+    configs/                    # 生成的各尺寸 config(tokenizer 为软链接)
+      README.md                 # 尺寸表 + 设计规则(脚本自动生成)
+  configs/                      # (阶段 3) 训练 YAML
+  data/                         # 语料(符号链接到实际存放处)
+  logs/                         # 运行日志
+  reports/                      # 拟合结果(带时间戳)
+  submodules/LLaMA-Factory/     # 训练框架(submodule, 需 init)
 ```
 
-## 8. 复用本机已有的 LLaMA-Factory 环境
+⚠️ **软链接注意**：`models/configs/*/tokenizer.json` 是指向 `models/templates/` 的软链接。
+新 clone 后软链接会悬空，**必须先跑一次 `make_model_ladder.py` 把模板下下来**。
+
+## 8. 环境与运行
 
 ```bash
-export HF_HOME=/volume/data/hjiang02/.cache/huggingface   # 登录 shell 里没设, 需手动
+# conda 装在 /opt（overlay），不在 /volume/data
+source /opt/miniconda3/etc/profile.d/conda.sh
+conda activate scalinglaw
+
 export DISABLE_VERSION_CHECK=1
 LLAMA_FACTORY=/volume/data/hjiang02/workspace/ScalingLaw/submodules/LLaMA-Factory
 llamafactory-cli train <config.yaml>
 ```
 
-环境已装好并验证：torch 2.8.0+cu128 / vllm 0.11.0 / flash-attn 2.8.3 / deepspeed 0.18.4，
-`train_from_scratch` 路径已实测跑通（从 config 随机初始化，loss 从 ~10.4 正常下降）。
+⚠️ **持久性警告**：`/opt` 在容器 overlay 层，**容器被驱逐/重建会连同环境一起丢失**。
+理想位置是 `/volume/data/hjiang02/`（持久），但该盘配额已满放不下。**拿到配额后应把
+miniconda 迁到 `/volume/data` 下重建。**
 
 ## 9. 关键参考
 
@@ -167,4 +197,5 @@ llamafactory-cli train <config.yaml>
 - Epoch AI 复现：arXiv:2404.10102 —— 重拟合得 α≈β≈0.35（修正指数与 20 tok/param 自洽）
 - Porian et al. 2024：arXiv:2406.19146 —— 调参对指数测量的影响（阶段 2 的依据）
 - datablations：arXiv:2305.16264 —— 重复数据下的缩放律修正（若超 1 epoch 必读）
-- FloydHub/nanoGPT 相关实现：`epoch-research/analyzing-chinchilla` 有从论文图里像素级反推的 245 个数据点
+- `epoch-research/analyzing-chinchilla`：从论文图里像素级反推的 245 个数据点
+- Pythia：arXiv:2304.01373 —— 模板来源，也是交叉验证的基准曲线
