@@ -53,10 +53,26 @@ LLaMA-Factory 装不上）—— 建环境时若不锁定版本，就会踩这�
 
 （`llama` 与 `gpt_neox` 在 4.57.1 / 5.17.0 下**都是** `True`。）
 
-所以旧版 PLAN 里"GPTNeoX 不支持 FlashAttention-2、只支持 SDPA"**是误判** —— 查的是一个
-被改名的属性。**但**：`flash-attn` 包当前**未安装**，所以 FA2 现在实际上仍用不了。
-能否启用、真实吞吐多少，**需要在装好 flash-attn 2.7.4 后实测**。在此之前 MFU 未知
-（旧记录 286 TFLOPS / 29% MFU 是在 2×H200 上测的，与本机不可比，已失效）。
+**实测结论（已装 flash-attn 2.7.4.post1 并跑通）**：GPTNeoX **支持** FA2 ——
+旧版 PLAN 里"GPTNeoX 不支持 FlashAttention-2、只支持 SDPA"**确认是误判**（查的是被改名的
+属性）。
+
+但更重要的发现是：**在这个配置下换注意力实现几乎没有收益**。实测 `pythia-184m`
+（d=768 / L=15，batch 16 × seq 2048，bf16，训练步）：
+
+| 实现 | tok/s | MFU | 相对 SDPA |
+|---|---|---|---|
+| `sdpa` | 218,564 | 24.3% | 1.00× |
+| `flash_attention_2` | 221,959 | 24.7% | **1.02×** |
+| `flex_attention` | 221,395 | 24.7% | 1.01× |
+
+（三者 loss 一致到 ~1e-2，是 bf16 归约顺序差异；flex_attention 首次需 autotune，
+多花约 24s 预编译。）
+
+**含义**：seq=2048 下 attention 不是瓶颈，MFU ~24.7% 的限制在别处（MLP/逐元素算子、
+batch 偏小、GPTNeoX 的 parallel residual 结构等）。**不要把 FA2 当吞吐解药** ——
+真正的杠杆是调 batch / seq / 模型宽度。注意这是单点测量：attention 开销随 `seq²` 增长，
+**更长的序列 FA2 才会体现优势**。
 
 ## 2. 模型尺寸阶梯
 
@@ -128,8 +144,9 @@ matrices" 以及 "we also count embeddings matrices in the total parameter count
 ### 阶段 1：小预算先验证闭环（1 个单元，~1 天）
 只跑一个小单元（比如 `pythia-86m` 或 `pythia-184m`）。目的：
 - 确认 `train_from_scratch` 路径、tokenizer/packing、loss 曲线形状正常
-- **装 flash-attn 2.7.4 并对比 FA2 / SDPA / flex_attn 的吞吐**（见 §1：能否用 FA2 尚未实测，
-  这是最大的吞吐不确定项），据此复测 MFU 并修正阶段 2 的 batch 设定
+- **扫 batch / seq 把 MFU 提上去**（见 §1：已实测三种注意力实现差异只有 1~2%，FA2 不是解药；
+  当前 MFU 仅 ~24.7% 且瓶颈不在 attention）。这是决定整个实验可不可行的关键数字 ——
+  按 24.7% MFU 估算 1e21 FLOPs 要跑很久
 - 顺便用 `pythia-14m` 这一档对齐官方曲线，验证实现正确性
 **不要跳过。**
 
@@ -208,10 +225,27 @@ LLAMA_FACTORY=/volume/data/hjiang02/workspace/ScalingLaw/submodules/LLaMA-Factor
 llamafactory-cli train <config.yaml>
 ```
 
-环境内容（`/opt/miniconda3/envs/scalinglaw`，约 6.8G）：python 3.11.16 /
+环境内容（`/opt/miniconda3/envs/scalinglaw`，约 6.8G + flash-attn）：python 3.11.16 /
 torch 2.6.0+cu124（CUDA 可用，识别 4 卡）/ transformers 4.57.1 / datasets 5.0.1 /
 accelerate 1.15.0 / peft 0.21.0 / tokenizers 0.22.2 / huggingface-hub 0.36.2 /
-safetensors 0.8.0 / sentencepiece 0.2.2 / einops 0.8.2 / triton 3.2.0。
+safetensors 0.8.0 / sentencepiece 0.2.2 / einops 0.8.2 / triton 3.2.0 /
+**flash-attn 2.7.4.post1**。
+
+**flash-attn 的装法**（这机器上不需要源码编译，别去 build）：GitHub releases 上有和本环境
+逐项对齐的预编译 wheel（cp311 + torch2.6 + cu12 + **cxx11abiFALSE** + linux_x86_64，
+180MB，实测下载 113 MB/s）。注意 **wheel 发在 `v2.7.4.post1` 那个 release 里，
+`v2.7.4` 本体的 assets 是空的**：
+
+```bash
+# 安装时务必 --no-deps，否则 pip 会去"修" torch / transformers
+pip install --no-deps \
+  https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+```
+
+选 wheel 的四个字段要和环境对上：`cp311`（python 3.11）、`torch2.6`、`cu12`、
+`cxx11abiFALSE`（用 `python -c "import torch;print(torch._C._GLIBCXX_USE_CXX11_ABI)"` 查）。
+装完已复验 torch / transformers 版本未被改动。wheel 副本留在
+`/opt/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl`。
 
 **已实测训练闭环**：用 `models/configs/pythia-14m` 的 config 建模型（参数
 **14,067,712**，与官方 pythia-14m 完全一致），在 GPU 上 loss 从 **10.85** 起步并正常下降。
