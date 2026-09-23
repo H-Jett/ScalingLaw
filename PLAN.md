@@ -30,14 +30,33 @@ config + tokenizer，尺寸通过改 4 个字段往上派生，配 `train_from_s
 | 项 | 值 | 来源 |
 |---|---|---|
 | GPU | **4 × H100 80GB** (HBM3) | `nvidia-smi` |
-| 系统 python | `/usr/bin/python3` = 3.12 + torch 2.6.0+cu124 + transformers 4.51.3 | 实测（**不要动，另建环境**） |
-| conda | `/opt/miniconda3`（新建）+ 环境 `scalinglaw`，见 §8 | 见 §8 |
+| 实验环境 | `/opt/miniconda3/envs/scalinglaw` = py3.11 + **torch 2.6.0+cu124** + **transformers 4.57.1** | 实测，见 §8 |
+| 系统 python | `/usr/bin/python3` = 3.12 + torch 2.6.0+cu124 + transformers 4.51.3 | **不要动** |
 | ⚠️ `/volume/data` | **配额已满，仅剩 ~776M**，写 1GB 在 700M 处报 `Disk quota exceeded` | 实测 |
-| `/` (overlay) | ~247G 可用，**但容器重建即丢** | `df -h` |
+| `/` (overlay) | ~238G 可用，**但容器重建即丢**（conda 装在这里） | `df -h` |
 
-⚠️ **注意力实现**：`GPTNeoX` 在 **transformers 4.51.3 里 `_supports_flash_attn_2 = True`**
-（旧版本 5.8.0 下不声明支持，那是版本特性，不是架构限制）。是否真的能跑 FA2 需在
-`scalinglaw` 环境里实测；`_supports_flex_attn` 也在。**当前 MFU 未知**，需复测。
+**transformers 版本受 LLaMA-Factory 约束**：v0.9.5 的 pyproject 要求
+`transformers>=4.55.0,<=5.6.0,!=4.52.0,!=4.57.0`，CI 只测 **4.55.0 / 4.57.1** 两个版本。
+本环境取 **4.57.1**（CI 实测版本）。⚠️ 注意 PyPI 默认装的是 5.x（会超出上界，导致
+LLaMA-Factory 装不上）—— 建环境时若不锁定版本，就会踩这个坑。LLaMA-Factory 的 docker
+基础镜像是 `hiyouga/pytorch:th2.6.0-cu124-flashattn2.7.4`：torch 版本与本环境一致，
+且**自带 flash-attn 2.7.4**。
+
+⚠️ **注意力实现（更正一条旧结论）**：**不能**用 `_supports_flash_attn_2` 判断是否支持 FA2 ——
+这个属性在 transformers 5.x 里被**改名**为 `_supports_flash_attn`。实测：
+
+| 版本 | `_supports_flash_attn_2` | `_supports_flash_attn` | `_supports_flex_attn` |
+|---|---|---|---|
+| 4.51.3 | `True` | — | — |
+| 4.57.1 | 不存在 | **`True`** | `True` |
+| 5.17.0 | 不存在 | **`True`** | `True` |
+
+（`llama` 与 `gpt_neox` 在 4.57.1 / 5.17.0 下**都是** `True`。）
+
+所以旧版 PLAN 里"GPTNeoX 不支持 FlashAttention-2、只支持 SDPA"**是误判** —— 查的是一个
+被改名的属性。**但**：`flash-attn` 包当前**未安装**，所以 FA2 现在实际上仍用不了。
+能否启用、真实吞吐多少，**需要在装好 flash-attn 2.7.4 后实测**。在此之前 MFU 未知
+（旧记录 286 TFLOPS / 29% MFU 是在 2×H200 上测的，与本机不可比，已失效）。
 
 ## 2. 模型尺寸阶梯
 
@@ -109,8 +128,8 @@ matrices" 以及 "we also count embeddings matrices in the total parameter count
 ### 阶段 1：小预算先验证闭环（1 个单元，~1 天）
 只跑一个小单元（比如 `pythia-86m` 或 `pythia-184m`）。目的：
 - 确认 `train_from_scratch` 路径、tokenizer/packing、loss 曲线形状正常
-- **复测吞吐与 MFU**（旧记录 286 TFLOPS/29% 是在 2×H200 + transformers 5.8 上测的，已失效），
-  据此修正阶段 2 的 batch 设定
+- **装 flash-attn 2.7.4 并对比 FA2 / SDPA / flex_attn 的吞吐**（见 §1：能否用 FA2 尚未实测，
+  这是最大的吞吐不确定项），据此复测 MFU 并修正阶段 2 的 batch 设定
 - 顺便用 `pythia-14m` 这一档对齐官方曲线，验证实现正确性
 **不要跳过。**
 
@@ -177,19 +196,41 @@ ScalingLaw/
 
 ## 8. 环境与运行
 
-```bash
-# conda 装在 /opt（overlay），不在 /volume/data
-source /opt/miniconda3/etc/profile.d/conda.sh
-conda activate scalinglaw
+环境装在 **`/opt/miniconda3`（overlay 盘），不在 `/volume/data`**（配额满，放不下）。
 
+```bash
+# 激活（一行）
+export PIP_CACHE_DIR=/opt/pip-cache && source /opt/miniconda3/etc/profile.d/conda.sh && conda activate scalinglaw
+
+# 训练
 export DISABLE_VERSION_CHECK=1
 LLAMA_FACTORY=/volume/data/hjiang02/workspace/ScalingLaw/submodules/LLaMA-Factory
 llamafactory-cli train <config.yaml>
 ```
 
-⚠️ **持久性警告**：`/opt` 在容器 overlay 层，**容器被驱逐/重建会连同环境一起丢失**。
-理想位置是 `/volume/data/hjiang02/`（持久），但该盘配额已满放不下。**拿到配额后应把
-miniconda 迁到 `/volume/data` 下重建。**
+环境内容（`/opt/miniconda3/envs/scalinglaw`，约 6.8G）：python 3.11.16 /
+torch 2.6.0+cu124（CUDA 可用，识别 4 卡）/ transformers 4.57.1 / datasets 5.0.1 /
+accelerate 1.15.0 / peft 0.21.0 / tokenizers 0.22.2 / huggingface-hub 0.36.2 /
+safetensors 0.8.0 / sentencepiece 0.2.2 / einops 0.8.2 / triton 3.2.0。
+
+**已实测训练闭环**：用 `models/configs/pythia-14m` 的 config 建模型（参数
+**14,067,712**，与官方 pythia-14m 完全一致），在 GPU 上 loss 从 **10.85** 起步并正常下降。
+`ln(50304) = 10.83` 正是随机初始化的理论值 —— 说明 tokenizer 与初始化都正确。
+
+⚠️ 四个坑：
+
+1. **持久性**：`/opt` 在容器 overlay 层，**容器被驱逐/重建会连同环境一起丢失**（这个项目
+   已经因此丢过一次记录）。理想位置是 `/volume/data/hjiang02/`（持久）但配额满。
+   **拿到配额后应把 miniconda 迁过去重建**，约十分钟
+2. **conda 26.x 的 ToS**：非交互 `conda create` 会要求 accept `repo.anaconda.com` 服务条款；
+   当时未代 accept（法律层面的同意不宜代做），改走 conda-forge
+   （`--override-channels -c conda-forge`）。故该环境基础包来自 conda-forge 而非 defaults。
+   若要用 defaults 的包，需自己先跑 `conda tos accept`
+3. **transformers 版本必须锁**：LLaMA-Factory v0.9.5 要求 `>=4.55.0,<=5.6.0,!=4.52.0,!=4.57.0`。
+   PyPI 默认给 5.x，**装完务必 `pip list | grep transformers` 复查**
+4. **LLaMA-Factory 尚未安装**（submodule 未 init）。装它时会按 pyproject 重新解析依赖
+   （含 `torchdata>=0.10.0,<=0.11.0` 等当前未装的包），**可能再改 transformers 版本** ——
+   装完必须复查版本仍在允许区间内
 
 ## 9. 关键参考
 
