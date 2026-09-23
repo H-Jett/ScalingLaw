@@ -1,0 +1,42 @@
+2026-09-23 19:02:38 [INFO] 日志: /volume/data/hjiang02/workspace/ScalingLaw/logs/make_model_ladder_20260923_190238.log
+2026-09-23 19:02:38 [INFO] 启动参数: {'root': '/volume/data/hjiang02/workspace/ScalingLaw', 'template_repo': 'EleutherAI/pythia-14m', 'endpoints': 'https://huggingface.co,https://hf-mirror.com', 'force': False, 'min': 10000000.0, 'max': 1000000000.0, 'count': 7, 'pin_template': True, 'ratio': 0.0, 'size_by': 'non-embedding', 'd_granularity': 64, 'depth_exponent': 0.5, 'aspect_penalty': 0.5, 'max_layers': 96, 'head_dim_min': 32, 'head_dim_max': 128, 'seq_len': None, 'dtype': None, 'copy_tokenizer': False, 'no_md': False, 'verify': True, 'self_test': False, 'dry_run': False}
+2026-09-23 19:02:38 [INFO] 模板已存在, 跳过下载: /volume/data/hjiang02/workspace/ScalingLaw/models/templates/pythia-14m
+2026-09-23 19:02:38 [INFO] 模板: EleutherAI/pythia-14m  源=cache  vocab=50304  d=128  L=6  heads=4  ffw=512  seq=2048  tie=False
+2026-09-23 19:02:38 [INFO] 阶梯口径=non-embedding  第1档锚点=1.190e+06  公比=3.072
+2026-09-23 19:02:38 [INFO] 目标: 1.2M → 3.7M → 11.2M → 34.5M → 106.0M → 325.5M → 1000.0M
+2026-09-23 19:02:38 [INFO] 长宽比律: L = 6·(d/128)^0.50  (锚点 = 模板 pythia-14m)
+2026-09-23 19:02:38 [INFO] 第 1 档 = 模板本身, 原样保留(d=128 L=6 heads=4)
+2026-09-23 19:02:38 [INFO] ================================================================================================================
+2026-09-23 19:02:38 [INFO] 尺寸表  (N_非emb = 12Ld² + 13Ld + 2d;  embedding = 2·50304·d)
+2026-09-23 19:02:38 [INFO] 目录名               d    L heads head_dim    ffw |    N_非emb       emb       N_总    emb占比 | L/L_ideal     目标偏差
+2026-09-23 19:02:38 [INFO] pythia-14m      128    6     4       32    512 |      1.2M     12.9M     14.1M    91.5% ⚠ |   1.000       模板
+2026-09-23 19:02:38 [INFO] pythia-23m      192    8     6       32    768 |      3.6M     19.3M     22.9M    84.4% ⚠ |   1.089    -2.6%
+2026-09-23 19:02:38 [INFO] pythia-43m      320    9    10       32   1280 |     11.1M     32.2M     43.3M    74.4% ⚠ |   0.949    -1.2%
+2026-09-23 19:02:38 [INFO] pythia-86m      512   11    16       32   2048 |     34.7M     51.5M     86.2M    59.8% ⚠ |   0.917    +0.5%
+2026-09-23 19:02:38 [INFO] pythia-184m     768   15    12       64   3072 |    106.3M     77.3M    183.6M    42.1% |   1.021    +0.3%
+2026-09-23 19:02:38 [INFO] pythia-442m    1216   18    19       64   4864 |    319.7M    122.3M    442.0M    27.7% |   0.973    -1.8%
+2026-09-23 19:02:38 [INFO] pythia-1.2b    1920   23    15      128   7680 |     1.02B    193.2M     1.21B    15.9% |   0.990    +1.8%
+2026-09-23 19:02:38 [INFO] ================================================================================================================
+2026-09-23 19:02:38 [INFO] 注: 目录名用**总参数量**口径(与 pythia 官方命名一致); N_非emb 才是计算层参数
+2026-09-23 19:02:38 [WARNING] pythia-14m: embedding 占 92% —— 主要参数是词表, 不是计算层
+2026-09-23 19:02:38 [WARNING] pythia-23m: embedding 占 84% —— 主要参数是词表, 不是计算层
+2026-09-23 19:02:38 [WARNING] pythia-43m: embedding 占 74% —— 主要参数是词表, 不是计算层
+2026-09-23 19:02:38 [WARNING] pythia-86m: embedding 占 60% —— 主要参数是词表, 不是计算层
+2026-09-23 19:02:38 [INFO] 已写出: /volume/data/hjiang02/workspace/ScalingLaw/models/configs/pythia-14m  (d=128 L=6 heads=4 ffw=512)
+2026-09-23 19:02:38 [INFO] 已写出: /volume/data/hjiang02/workspace/ScalingLaw/models/configs/pythia-23m  (d=192 L=8 heads=6 ffw=768)
+2026-09-23 19:02:38 [INFO] 已写出: /volume/data/hjiang02/workspace/ScalingLaw/models/configs/pythia-43m  (d=320 L=9 heads=10 ffw=1280)
+2026-09-23 19:02:38 [INFO] 已写出: /volume/data/hjiang02/workspace/ScalingLaw/models/configs/pythia-86m  (d=512 L=11 heads=16 ffw=2048)
+2026-09-23 19:02:38 [INFO] 已写出: /volume/data/hjiang02/workspace/ScalingLaw/models/configs/pythia-184m  (d=768 L=15 heads=12 ffw=3072)
+2026-09-23 19:02:38 [INFO] 已写出: /volume/data/hjiang02/workspace/ScalingLaw/models/configs/pythia-442m  (d=1216 L=18 heads=19 ffw=4864)
+2026-09-23 19:02:38 [INFO] 已写出: /volume/data/hjiang02/workspace/ScalingLaw/models/configs/pythia-1.2b  (d=1920 L=23 heads=15 ffw=7680)
+2026-09-23 19:02:38 [INFO] ----------------------------------------------------------------------------------------------------
+2026-09-23 19:02:38 [INFO] 实建校验(transformers 在 meta device 上建模型数参数, 不占显存)
+2026-09-23 19:02:38 [INFO] 名称                     公式总参           实建总参         误差
+2026-09-23 19:02:41 [INFO] pythia-14m       14,067,712     14,067,712          0
+2026-09-23 19:02:41 [INFO] pythia-23m       22,876,032     22,876,032          0
+2026-09-23 19:02:41 [INFO] pythia-43m       43,291,840     43,291,840          0
+2026-09-23 19:02:41 [INFO] pythia-86m       86,188,544     86,188,544          0
+2026-09-23 19:02:41 [INFO] pythia-184m     183,586,560    183,586,560          0
+2026-09-23 19:02:41 [INFO] pythia-442m     442,016,000    442,016,000          0
+2026-09-23 19:02:41 [INFO] pythia-1.2b   1,211,191,680  1,211,191,680          0
+2026-09-23 19:02:41 [INFO] 校验: 全部一致 ✅
