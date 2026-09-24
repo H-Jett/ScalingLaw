@@ -158,35 +158,74 @@ matrices" 以及 "we also count embeddings matrices in the total parameter count
 论文"embedding 贡献很小"的前提在小端**不成立** —— 这里要做敏感性分析：两个口径各算一遍，
 看谷底位置移动多少。
 
-## 4. 数据
+## 4. 数据（✅ 已就绪）
 
-**`HuggingFaceFW/fineweb-edu` 的 `sample/100BT` 子集**（HF 上三个子集都在：`10BT`/`100BT`/`350BT`）。
+**`fineweb-edu` 的 `sample/100BT` 子集**，已在机器上：
+`/volume/data/hjiang02/open_source/datasets/fineweb/sample/100BT`（**只读，不要动**）。
+
+实测盘点结果（`python scripts/corpus.py`）：
+
+| 项 | 值 |
+|---|---|
+| 分片 | **150 个 parquet**，282G |
+| 行数 | 147,639,585 |
+| tokens | **103.03B**（parquet 自带 `token_count` 列口径） |
+| 列 | `text` / `id` / `dump` / `url` / `date` / `language` / `language_score` / `token_count` |
+
+**能直接用，不需要转换**，但有两个必须显式指定的字段（否则跑不起来或读到空）：
+
+```json
+{"<数据集名>": {"file_name": "raw", "formatting": "alpaca", "columns": {"prompt": "text"}}}
+```
+
+- `formatting: alpaca` —— 走非 sharegpt 分支
+- **`columns.prompt = text`** —— pt 阶段框架最终读 `_prompt` 列（`pretrain.py:30`），
+  而 `columns.prompt` 默认是 `"instruction"`。我们的正文列叫 `text`，不映射就读不到
+
+另外两个设计取舍：
+- **不预 tokenize** —— 框架自己 tokenize + packing，省掉一份几百 G 的中间产物
+- **用软链接不拷贝** —— 每个 run 的 `data/raw/` 是指向语料分片的软链接。282G 语料
+  只有一份，每个 run 复制一份会把配额吃光
+
+**token 数怎么算的**：parquet 的 `token_count` 是 fineweb 自家 tokenizer 的口径，与我们
+用的 Pythia tokenizer 不同。抽样 3000 条实测**偏差只有 1.0033 倍（≤0.4%）**，所以直接拿
+它做预算，不必为了数 token 把 282G 跑一遍（盘点 150 个分片只要 66 秒）。
 
 为什么不需要凑 math/code 配比：论文 **App. C / Table A2** 专门做了跨数据集对照——单用 C4 得
 `(a,b)=(0.50,0.50)`，单用 GitHub code 得 `(0.53,0.47)`，与主结论一致。论文结论：
 **只要训练不超过 1 个 epoch，缩放律与数据集无关。**
 
 100BT 是**单次 run** 的上限（超过 1 epoch 就要引入 datablock 的重复数据修正），
-多个 run 可以复用同一份语料。
+多个 run 可以复用同一份语料（每个 run 按 run 名做种子取**不同切片**，互不重叠）。
 
-⚠️ **磁盘**：tokenized 语料的体积是几百 GB 量级，当前 `/volume/data` 配额已满，**阶段 0 之前
-必须先解决**（申请配额 / 清理 / 换存储）。
+⚠️ **磁盘**：`/volume/data` 配额**长期只剩 <1G**。语料本身已经在盘上（不用再占），但
+每个 run 的框架输出要 58~92M（其中 `out/model.safetensors` 占绝大多数）。跑网格前必须
+处理：要么清掉旧 run，要么申请配额放开。**`pythia-1.2b` 那档权重 4.8G，现在一定写不下。**
 
 ## 5. 实施步骤
 
-### 阶段 0：环境 + 语料（~1 天）
-- **环境已就绪，无需搭建**（见 §8：用平台自带 `/usr/bin/python3`，不要建 conda）
-- **先解决 `/volume/data` 配额**（见 §4 ⚠️）—— 这是**唯一的硬阻塞**
-- 下 fineweb-edu `sample/100BT`，转成 LLaMA-Factory 的 pt 格式（text 字段）
-- 产出 `data/chinchilla_corpus/` + `dataset_info.json` 条目
+### 阶段 0：环境 + 语料 ✅ **已完成**
+- ✅ 环境已就绪，无需搭建（见 §8：用平台自带 `/usr/bin/python3`，不要建 conda）
+- ✅ 语料已就绪，无需转换（见 §4；接入方式已验证）
+- ✅ `scripts/corpus.py` 能盘点/切片/落地数据集
+- ⚠️ **仍待解决**：`/volume/data` 配额（见 §4 ⚠️）—— 不阻塞训练，阻塞**存权重**
 
-### 阶段 1：小预算先验证闭环（1 个单元，~1 天）
-只跑一个小单元（比如 `pythia-86m` 或 `pythia-184m`）。目的：
-- 确认 `train_from_scratch` 路径、tokenizer/packing、loss 曲线形状正常
-- **扫 batch / seq 把 MFU 提上去**。见 §1 已测数据：MFU 天花板 ~25~27%，且
-  **seq=2048 时最高（25.4%）并随序列长度单调下降**，所以起点就用 **seq=2048**；
-  再往上调的是**宽度 / batch**，不是注意力实现（三种注意力实现差异只有 1~2%）
-- 顺便用 `pythia-14m` 这一档对齐官方曲线，验证实现正确性
+### 阶段 1：小预算先验证闭环 ✅ **基本完成**
+- ✅ `scripts/train_abl.py` 一条命令跑通全流程（备数据→配置→训练→出图）
+- ✅ 端到端实测两个尺寸，均 exit 0，**参数量与公式逐位相符**：
+
+  | run | 参数量（实测 vs 公式） | loss | 用时 |
+  |---|---|---|---|
+  | `pythia-14m` | 14,067,712 == 14,067,712 ✓ | 11.02 → 6.25 | 4.4 min |
+  | `pythia-23m` | 22,876,032 == 22,876,032 ✓ | 10.98 → 7.22 | 4.1 min |
+
+- ✅ 参数复核内建（`cross_check_params`），每次 run 自动对公式
+- ✅ swanlab 本地模式可用；云端需 `SWANLAB_API_KEY`
+- ⏳ **尚未做**：
+  - **扫 batch / seq 把 MFU 提上去**。见 §1 已测数据：MFU 天花板 ~25~27%，且
+    **seq=2048 时最高（25.4%）并随序列长度单调下降**，所以起点已定为 **seq=2048**；
+    再往上调的是**宽度 / batch**，不是注意力实现（三种注意力实现差异只有 1~2%）
+  - 用 `pythia-14m` 对齐官方曲线（需要官方权重做对比，见 §2）
 **不要跳过。**
 
 ### 阶段 2：**按尺寸调 batch / LR / β2**（~1 周）⚠️ 不可跳过
@@ -234,22 +273,25 @@ ScalingLaw/
   PLAN.md                       # 本文件
   scripts/
     make_model_ladder.py        # 从 pythia-14m 模板派生尺寸阶梯(config+tokenizer, 无权重)
+    corpus.py                   # 语料盘点 / 切片规划 / 落地成 LLaMA-Factory 数据集
+    train_abl.py                # 一个 run 的编排: 预算 -> 备数据 -> 生成配置 -> 训练 -> 出图
+    plot_run.py                 # 读本地 loss 记录画曲线(单 run / 多 run 叠加)
     # run_grid.py               # (阶段 3 再写) 批量执行 + 断点续跑
     # fit_scaling.py            # (阶段 4 再写) 抛物线拟合 + 幂律拟合
   models/
     templates/pythia-14m/       # 下载的官方模板(尺寸设计的锚点)
     configs/                    # 生成的各尺寸 config(tokenizer 为软链接)
       README.md                 # 尺寸表 + 设计规则(脚本自动生成)
-  configs/                      # (阶段 3) 训练 YAML
-  data/                         # 语料(符号链接到实际存放处)
-  logs/                         # 运行日志
-  reports/                      # 拟合结果(带时间戳)
+  runs/<run 名>/                # 每次实验的全部产物, 见 §9
+  logs/<run 名>.log             # 每次 run 的完整 stdout
+  reports/                      # (阶段 4) 拟合结果(带时间戳)
   submodules/LLaMA-Factory/     # 训练框架(submodule, 需 init, 见 §8.1)
 ```
 
 ⚠️ **软链接注意**：`models/configs/*/tokenizer.json` 是指向 `models/templates/` 的软链接。
 新 clone 后软链接会悬空，**必须先跑一次 `make_model_ladder.py` 把模板下下来**。
 另外 `workspace/LLaMA-Factory -> submodules/LLaMA-Factory` 这条链接（§8.1）也需要重建。
+每个 run 的 `runs/<名>/data/raw/*.parquet` 也是软链接，指向 open_source 里的语料。
 
 ## 8. 环境与运行
 
@@ -327,7 +369,79 @@ transformers** —— 那会把 torch/accelerate 一起拖下水。需要时用 
 附近（10.77）起步并正常下降 —— 说明 tokenizer 与初始化都正确。4 卡
 （`FORCE_TORCHRUN=1`）实跑 exit 0，NCCL 总线带宽 281.5 GB/s。
 
-## 9. 关键参考
+## 9. 一次实验的产物说明（`runs/<run 名>/`）
+
+`train_abl.py` 跑完一个 run 后，产物全部落在 `runs/<run 名>/` 下。**每个 run 自带全部
+证据**，事后不用回忆当时怎么跑的。分组如下：
+
+### 9.1 我们生成的（复现与口径的依据）
+
+| 文件 | 是什么 | 为什么留着 |
+|---|---|---|
+| `train.yaml` | 完整的 LLaMA-Factory 配置 | **可直接重跑**；也是"当时到底用了什么超参"的唯一权威 |
+| `budget.json` | `N_total`/`N_nonemb`/`D`/`C=6ND`/`tokens_per_step`/`steps`/`tok-per-param` | **阶段 4 拟合的输入**——横轴 `C` 和纵轴 `loss` 都从这里取 |
+| `data/dataset_info.json` | 本次语料的数据集配置（`columns.prompt=text` 等） | 记录数据是怎么接进去的 |
+| `data/raw/shard_NNNN.parquet` | **软链接**，指向 `open_source/.../100BT/` 里的真实分片 | 记录"这次到底喂了哪些分片"；不拷贝，282G 语料只存一份 |
+| `loss.png` | loss-vs-step + loss-vs-tokens 双面板曲线 | 一眼看收敛形状 |
+| `summary.json` | 首/末/尾部均值/最小 loss、步数、token 数 | 阶段 4 汇总时不用重读 parquet |
+| `train.log` | 框架完整 stdout | 出问题时唯一的现场 |
+
+### 9.2 框架自己写的（`out/` 下，**不要手改**）
+
+| 文件 | 是什么 | 备注 |
+|---|---|---|
+| `out/trainer_log.jsonl` | **逐点 loss/lr/epoch，每步一行（追加写）** | ★ `loss.png` 就是从它画的；**所以上报通道挂了曲线也不丢**。注意是追加写，所以 `output_dir` 必须逐 run 分开 |
+| `out/trainer_state.json` | HF 的完整训练状态（含 `log_history`、`global_step`、`total_flos`） | 比 jsonl 更全，但结构嵌套 |
+| `out/train_results.json` | 收尾汇总：`train_loss`/`train_runtime`/`samples_per_second`/`total_flos` | `total_flos` 有个口径坑，见 §9.4 |
+| `out/all_results.json` | 同上的副本（HF 给"所有阶段结果"留的位置） | — |
+| `out/runs/*/events.out.tfevents.*` | TensorBoard 事件（`report_to: tensorboard`） | 本地 loss 的第二份记录 |
+| `out/model.safetensors` | **最终模型权重** | ⚠️ 磁盘大户（14m 就 54M）；拟合只需 loss，默认**不存**中间检查点 |
+| `out/config.json` `generation_config.json` `tokenizer.json` `tokenizer_config.json` `chat_template.jinja` | 模型卡与分词器副本 | 框架自动拷到 output_dir |
+| `out/README.md` | 自动生成的模型卡 | 没手写内容，当噪声看即可 |
+| `out/checkpoint-*/` | 检查点（`--save-final` 时才出现） | 含 `rng_state_*.pth`，逐卡一份 |
+
+### 9.3 swanlab
+
+`runs/_swanlab/` 是 **local 模式的落盘目录，被所有 run 共享**（不是每个 run 一份）：
+
+- `run-<时间戳>-<id>/` —— 每个 run 一个子目录，含 `files/config.yaml`、`console/`、`logs/`
+- `out/swanlab_public_config.json` —— 由框架写在 run 自己的目录里，指明本次 run 对应
+  `_swanlab/` 下的哪个子目录（`run_id` 就是关联键）
+- 云端模式下 `_swanlab/` 仍会生成一份本地缓存，作为上传失败的兜底
+
+### 9.4 ⚠️ 两个口径坑（都已在代码里处理，这里备查）
+
+**坑 1：`tokens_per_step` 必须乘 `world_size`。** 漏掉 GPU 数会让实际 `D` 只有预期的
+1/4，isoFLOP 剖面直接废掉。已在 `train_abl.plan_budget` 里固定。
+
+**坑 2：HF 的 `total_flos` 不能当成 `C = 6ND` 用。** 实测（transformers 5.8.0，
+`trainer.py:3900`）HF 的口径是：
+
+```
+6 × num_parameters(exclude_embeddings=True) × tokens
+```
+
+而 `exclude_embeddings=True` 在 `tie_word_embeddings=False` 时**只排除了输入
+embedding，LM head 仍被算进去** —— 于是它既不是论文的 `N_total` 也不是真正的
+non-embedding，是个中间量。危害在于**偏差随尺寸变化**：
+
+| 尺寸 | `N_total` | HF 口径 / 论文口径 |
+|---|---|---|
+| `pythia-14m` | 14.1M | **0.542** |
+| `pythia-86m` | 86.2M | 0.701 |
+| `pythia-442m` | 442.0M | 0.862 |
+| `pythia-1.2b` | 1.21B | **0.920** |
+
+从 14m 到 1.2b 差了 **1.7 倍**。若拿 `total_flos` 当横轴 `C`，小模型会被系统性压向
+一侧，**直接扭曲拟合出的指数 `a`** —— 而且因为偏差是尺寸相关的，它不会表现为一个
+可辨识的常数偏移，很难事后发现。
+
+**所以横轴一律用 `budget.json` 里的 `flops`（= `6·N_total·D`，论文口径）。**
+`train_abl.warn_flos_trap` 每次 run 都会把两者的比值打出来提醒（实测比值与预测
+`1 - vocab·d/N_total` 完全吻合）。注意这与论文"把 embedding 算进总参数"的表述一致
+（§3），口径不要混。
+
+## 10. 关键参考
 
 - 原文：arXiv:2203.15556（Table A9 尺寸表、App. B cosine、App. C 跨数据集、App. F FLOPs 计数）
 - Epoch AI 复现：arXiv:2404.10102 —— 重拟合得 α≈β≈0.35（修正指数与 20 tok/param 自洽）

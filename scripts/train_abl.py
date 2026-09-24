@@ -312,6 +312,53 @@ def cross_check_params(run_dir: Path, params: dict) -> None:
         )
 
 
+def warn_flos_trap(run_dir: Path, params: dict, budget: dict) -> None:
+    """⚠️ 提醒: HF 记的 `total_flos` **不能**当成 C=6ND 用。
+
+    实测(transformers 5.8.0, trainer.py:3900)HF 的口径是:
+        6 × num_parameters(exclude_embeddings=True) × tokens
+    而 `exclude_embeddings=True` 在 `tie_word_embeddings=False` 时**只排除了输入
+    embedding, LM head(输出 embedding)仍被算进去** —— 于是它既不是论文的
+    `N_total` 也不是真正的 non-embedding, 是个中间量。
+
+    危害在于**偏差随尺寸变化**: 我们的 vocab=50304 偏大, embedding 占比从
+    14m 的 91.5% 降到 1.2b 的 15.9%, 所以
+
+        HF口径 / 论文口径 = 1 - vocab·d / N_total
+
+    从 14m 的 0.542 一路升到 1.2b 的 0.920 —— 差 1.7 倍。若拿它当横轴 C,
+    小模型会被系统性地压向一侧, 直接扭曲拟合出的指数 a。
+
+    所以横轴一律用 budget.json 里的 `flops`(= 6·N_total·D, 论文口径)。
+    这里只在两者差异明显时打印一行提示, 不改任何东西。
+    """
+    res = None
+    for cand in [run_dir / "train_results.json", *sorted(run_dir.glob("*/train_results.json"))]:
+        if cand.exists():
+            res = json.loads(cand.read_text())
+            break
+    if not res or not res.get("total_flos"):
+        return
+
+    hf_flos = float(res["total_flos"])
+    ours = budget["flops"]
+    predicted_ratio = 1 - params["n_embed"] / 2 / params["n_total"]  # 1 - 一个embedding/N
+    LOG.info(
+        "⚠️  HF 的 total_flos = %.3e, 论文口径 6ND = %.3e (比值 %.3f) —— 这是已知口径差异, 不是 bug",
+        hf_flos, ours, hf_flos / ours,
+    )
+    LOG.info(
+        "    原因: HF 用 6×num_parameters(exclude_embeddings=True)×tokens, 而我们 vocab=%d 且"
+        " tie=False, 它只排除了输入 embedding、漏掉 LM head。",
+        params["vocab"],
+    )
+    LOG.info(
+        "    → 横轴 C 请用 budget.json 的 flops(=6·N_total·D)。该口径差异随尺寸从 0.542(14m)"
+        " 变到 0.920(1.2b), 若误用会扭曲指数 a。本次预测比值 %.3f",
+        predicted_ratio,
+    )
+
+
 def bj_now() -> str:
     return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
 
@@ -446,6 +493,7 @@ def main() -> int:
         return code
 
     cross_check_params(run_dir, params)
+    warn_flos_trap(run_dir, params, budget)
 
     # ---- 5. 出图 ---------------------------------------------------------- #
     LOG.info("-" * 78)
