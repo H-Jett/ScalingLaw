@@ -25,54 +25,92 @@ config + tokenizer，尺寸通过改 4 个字段往上派生，配 `train_from_s
 且指数对架构是弱敏感的（论文 App. C 演示了跨数据集指数几乎不动）。**所以架构选型是工程
 效率问题，不是保真度问题。**
 
-## 1. 环境事实（2026-09-23 实测）
+## 1. 环境事实（2026-09-24 实测，已验证可训练）
 
 | 项 | 值 | 来源 |
 |---|---|---|
-| GPU | **4 × H100 80GB** (HBM3) | `nvidia-smi` |
-| 实验环境 | `/opt/miniconda3/envs/scalinglaw` = py3.11 + **torch 2.6.0+cu124** + **transformers 4.57.1** | 实测，见 §8 |
-| 系统 python | `/usr/bin/python3` = 3.12 + torch 2.6.0+cu124 + transformers 4.51.3 | **不要动** |
-| ⚠️ `/volume/data` | **配额已满，仅剩 ~776M**，写 1GB 在 700M 处报 `Disk quota exceeded` | 实测 |
-| `/` (overlay) | ~238G 可用，**但容器重建即丢**（conda 装在这里） | `df -h` |
+| GPU | **4 × H100 80GB HBM3**，卡间 **NVLink**（`nvidia-smi topo -m` 全 `NV18` = 18 条链路） | `nvidia-smi` |
+| CPU / 内存 | **192 核 / 2.0 TB** | `nproc` / `free -g` |
+| `/dev/shm` | **880 GB**（多卡 dataloader 不会撞 shm 上限） | `df -h` |
+| 驱动 / CUDA | 570.133.20 / CUDA 12.9 | `nvidia-smi` |
+| Python | `/usr/bin/python3` = **3.12.3**，**就是这套**（无独立 conda 环境） | 实测 |
+| torch | **2.8.0+cu128**（`cxx11abiFALSE`） | 实测 |
+| transformers | **5.8.0** | 实测 |
+| flash-attn | **2.8.3**（已装，`import` 可用） | 实测 |
+| 其它 | deepspeed 0.18.4 / vllm 0.11.0 / peft 0.18.1 / accelerate 1.11.0 / datasets 4.0.0 / torchdata 0.11.0 / bitsandbytes 0.50.2 / triton 3.4.0 | `pip list` |
+| LLaMA-Factory | **0.9.5**，见 §8（submodule + 符号链接） | 实测跑通 |
+| ⚠️ `/volume/data` | **配额已满，仅剩 ~764M**，写 1GB 在 700M 处报 `Disk quota exceeded` | 实测 |
+| `/` (overlay) | ~183G 可用，**但容器重建即丢** | `df -h` |
+| 容器 | pod `dev-scalinglaw-151a86d5-master-0`，`PET_NNODES=1`（**开发容器，非训练任务容器**） | `env` |
 
-**transformers 版本受 LLaMA-Factory 约束**：v0.9.5 的 pyproject 要求
-`transformers>=4.55.0,<=5.6.0,!=4.52.0,!=4.57.0`，CI 只测 **4.55.0 / 4.57.1** 两个版本。
-本环境取 **4.57.1**（CI 实测版本）。⚠️ 注意 PyPI 默认装的是 5.x（会超出上界，导致
-LLaMA-Factory 装不上）—— 建环境时若不锁定版本，就会踩这个坑。LLaMA-Factory 的 docker
-基础镜像是 `hiyouga/pytorch:th2.6.0-cu124-flashattn2.7.4`：torch 版本与本环境一致，
-且**自带 flash-attn 2.7.4**。
+⚠️ **这套环境是平台配额配好的，各依赖全卡在上界，是自洽的一套 —— 不要重装、不要升级**：
 
-⚠️ **注意力实现（更正一条旧结论）**：**不能**用 `_supports_flash_attn_2` 判断是否支持 FA2 ——
-这个属性在 transformers 5.x 里被**改名**为 `_supports_flash_attn`。实测：
+```
+transformers                     5.8.0     (LLaMA-Factory 0.9.6.dev0 允许 <=5.8.0)
+accelerate                      1.11.0     (peft 要求 <=1.11.0)
+datasets                         4.0.0     (要求 <=4.0.0)
+peft                            0.18.1     (要求 <=0.18.1)
+torchdata                       0.11.0     (要求 <=0.11.0)
+```
 
-| 版本 | `_supports_flash_attn_2` | `_supports_flash_attn` | `_supports_flex_attn` |
+**注意 `transformers 5.8.0` 与我们的 submodule（LLaMA-Factory **0.9.5**，
+声明 `<=5.6.0`）存在版本错位** —— 但 **实测能正常工作**（见下）。
+
+### 1.1 实测结论：能训练
+
+**端到端训练已跑通**（用 `models/configs/pythia-14m` 的 config + `train_from_scratch`）：
+
+```
+Number of trainable parameters = 14,067,712        ← 与官方 pythia-14m 一致
+loss 10.77 → 9.627；模型正常保存
+4 卡: "Initializing 4 distributed tasks"，exit 0，22.83 steps/s（与单卡一致）
+```
+
+**吞吐实测**（`pythia-184m`，d=768 / L=15，bf16，训练步）：
+
+| 配置 | tok/s | MFU | 相对 SDPA |
 |---|---|---|---|
-| 4.51.3 | `True` | — | — |
-| 4.57.1 | 不存在 | **`True`** | `True` |
-| 5.17.0 | 不存在 | **`True`** | `True` |
+| seq=2048, `sdpa` | 218,564 | 24.3% | 1.00× |
+| seq=2048, `flash_attention_2` | 221,959 | 24.7% | 1.02× |
+| seq=2048, `flex_attention` | 221,395 | 24.7% | 1.01× |
 
-（`llama` 与 `gpt_neox` 在 4.57.1 / 5.17.0 下**都是** `True`。）
+**FA2 的收益已扫过序列长度：速度上几乎没有，真正的价值是显存。**
+（`pythia-184m`，bf16，真实训练步；每档 batch 取到不 OOM 为止）
 
-**实测结论（已装 flash-attn 2.7.4.post1 并跑通）**：GPTNeoX **支持** FA2 ——
-旧版 PLAN 里"GPTNeoX 不支持 FlashAttention-2、只支持 SDPA"**确认是误判**（查的是被改名的
-属性）。
+| seq | batch | SDPA (tok/s / MFU) | FA2 (tok/s / MFU) | FA2 加速比 |
+|---|---|---|---|---|
+| 2048 | 16 | 227,793 / 25.4% | 231,080 / 25.7% | 1.01× |
+| 4096 | 8 | 200,847 / 22.4% | 204,761 / 22.8% | 1.02× |
+| 8192 | 4 | 162,767 / 18.1% | 166,736 / 18.6% | 1.02× |
+| **8192** | **8** | **OOM** | **170,771 / 19.0%** | — |
+| 16384 | 2 | 119,622 / 13.3% | 123,370 / 13.7% | 1.03× |
 
-但更重要的发现是：**在这个配置下换注意力实现几乎没有收益**。实测 `pythia-184m`
-（d=768 / L=15，batch 16 × seq 2048，bf16，训练步）：
+两个结论：
 
-| 实现 | tok/s | MFU | 相对 SDPA |
-|---|---|---|---|
-| `sdpa` | 218,564 | 24.3% | 1.00× |
-| `flash_attention_2` | 221,959 | 24.7% | **1.02×** |
-| `flex_attention` | 221,395 | 24.7% | 1.01× |
+1. **FA2 只快 1~3%，连 seq=16384 也一样** —— 所以"长序列才体现 FA2 优势"这个常见说法
+   **在本配置下不成立**。别指望 FA2 提速。
+2. **FA2 的真正价值是显存**：seq=8192 时 SDPA 在 batch=8 直接 OOM，FA2 能跑。
+   即 FA2 换来的是**更大的 batch**，不是更快的算子。
+3. 附带发现：**MFU 随序列长度单调下降**（25.4% → 13.3%），token 吞吐也一样降。
+   所以 **seq=2048 是这套配置下效率最高的选择** —— 正好与 Chinchilla 论文用的 2048 一致。
 
-（三者 loss 一致到 ~1e-2，是 bf16 归约顺序差异；flex_attention 首次需 autotune，
-多花约 24s 预编译。）
+**架构层事实**（用**正确**的属性名 `_supports_flash_attn` 查，实测 `gpt_neox` 与 `llama`
+都是 `True`）：
 
-**含义**：seq=2048 下 attention 不是瓶颈，MFU ~24.7% 的限制在别处（MLP/逐元素算子、
-batch 偏小、GPTNeoX 的 parallel residual 结构等）。**不要把 FA2 当吞吐解药** ——
-真正的杠杆是调 batch / seq / 模型宽度。注意这是单点测量：attention 开销随 `seq²` 增长，
-**更长的序列 FA2 才会体现优势**。
+| 版本 | `_supports_flash_attn_2` | `_supports_flash_attn` | `_supports_flex_attn` | `_supports_sdpa` |
+|---|---|---|---|---|
+| 4.51.3 | `True` | — | — | `True` |
+| 4.57.1 | 不存在 | **`True`** | `True` | `True` |
+| 5.8.0（本环境） | 不存在 | **`True`** | `True` | `True` |
+| 5.17.0 | 不存在 | **`True`** | `True` | `True` |
+
+⚠️ **别用 `_supports_flash_attn_2` 判断 FA2 支持** —— 该属性在 5.x 里**改名**为
+`_supports_flash_attn`。本项目此前两度因此得出错误结论（旧版说"GPTNeoX 不支持 FA2"，
+是误判）。**GPTNeoX 支持 FA2**，实测可用。
+
+**MFU 天花板 ~25~27%**（对 GPT-NeoX 小模型），已在两套不同环境里**独立复现两次**，
+所以不是环境问题，是架构 + 小尺寸的固有特性。**注意力实现不是主要杠杆**，真正该调的是
+batch / seq / 宽度。
 
 ## 2. 模型尺寸阶梯
 
@@ -137,16 +175,17 @@ matrices" 以及 "we also count embeddings matrices in the total parameter count
 ## 5. 实施步骤
 
 ### 阶段 0：环境 + 语料（~1 天）
-- miniconda + `scalinglaw` 环境（见 §8）
+- **环境已就绪，无需搭建**（见 §8：用平台自带 `/usr/bin/python3`，不要建 conda）
+- **先解决 `/volume/data` 配额**（见 §4 ⚠️）—— 这是**唯一的硬阻塞**
 - 下 fineweb-edu `sample/100BT`，转成 LLaMA-Factory 的 pt 格式（text 字段）
 - 产出 `data/chinchilla_corpus/` + `dataset_info.json` 条目
 
 ### 阶段 1：小预算先验证闭环（1 个单元，~1 天）
 只跑一个小单元（比如 `pythia-86m` 或 `pythia-184m`）。目的：
 - 确认 `train_from_scratch` 路径、tokenizer/packing、loss 曲线形状正常
-- **扫 batch / seq 把 MFU 提上去**（见 §1：已实测三种注意力实现差异只有 1~2%，FA2 不是解药；
-  当前 MFU 仅 ~24.7% 且瓶颈不在 attention）。这是决定整个实验可不可行的关键数字 ——
-  按 24.7% MFU 估算 1e21 FLOPs 要跑很久
+- **扫 batch / seq 把 MFU 提上去**。见 §1 已测数据：MFU 天花板 ~25~27%，且
+  **seq=2048 时最高（25.4%）并随序列长度单调下降**，所以起点就用 **seq=2048**；
+  再往上调的是**宽度 / batch**，不是注意力实现（三种注意力实现差异只有 1~2%）
 - 顺便用 `pythia-14m` 这一档对齐官方曲线，验证实现正确性
 **不要跳过。**
 
@@ -205,66 +244,88 @@ ScalingLaw/
   data/                         # 语料(符号链接到实际存放处)
   logs/                         # 运行日志
   reports/                      # 拟合结果(带时间戳)
-  submodules/LLaMA-Factory/     # 训练框架(submodule, 需 init)
+  submodules/LLaMA-Factory/     # 训练框架(submodule, 需 init, 见 §8.1)
 ```
 
 ⚠️ **软链接注意**：`models/configs/*/tokenizer.json` 是指向 `models/templates/` 的软链接。
 新 clone 后软链接会悬空，**必须先跑一次 `make_model_ladder.py` 把模板下下来**。
+另外 `workspace/LLaMA-Factory -> submodules/LLaMA-Factory` 这条链接（§8.1）也需要重建。
 
 ## 8. 环境与运行
 
-环境装在 **`/opt/miniconda3`（overlay 盘），不在 `/volume/data`**（配额满，放不下）。
+**结论（2026-09-24）：不建独立环境，直接用平台自带的 `/usr/bin/python3`。**
+下面这套是平台镜像配额配好的，**自洽且已验证可训** —— 不需要 conda，也**不要重装/升级任何包**。
 
 ```bash
-# 激活（一行）
-export PIP_CACHE_DIR=/opt/pip-cache && source /opt/miniconda3/etc/profile.d/conda.sh && conda activate scalinglaw
-
-# 训练
-export DISABLE_VERSION_CHECK=1
-LLAMA_FACTORY=/volume/data/hjiang02/workspace/ScalingLaw/submodules/LLaMA-Factory
-llamafactory-cli train <config.yaml>
+# 跑训练（无需 activate，无 conda）
+export DISABLE_VERSION_CHECK=1          # 版本错位的豁免（见下）
+cd /volume/data/hjiang02/workspace/ScalingLaw
+llamafactory-cli train <config.yaml>     # 或 python -m llamafactory.cli train <config.yaml>
 ```
 
-环境内容（`/opt/miniconda3/envs/scalinglaw`，约 6.8G + flash-attn）：python 3.11.16 /
-torch 2.6.0+cu124（CUDA 可用，识别 4 卡）/ transformers 4.57.1 / datasets 5.0.1 /
-accelerate 1.15.0 / peft 0.21.0 / tokenizers 0.22.2 / huggingface-hub 0.36.2 /
-safetensors 0.8.0 / sentencepiece 0.2.2 / einops 0.8.2 / triton 3.2.0 /
-**flash-attn 2.7.4.post1**。
+| 项 | 值 |
+|---|---|
+| Python | `/usr/bin/python3` = **3.12.3** |
+| torch | **2.8.0+cu128**（`cxx11abiFALSE`；CUDA 12.8，`torch.cuda.device_count() == 4`） |
+| transformers | **5.8.0** |
+| flash-attn | **2.8.3**（`import flash_attn` 可用） |
+| datasets / accelerate / peft / deepspeed | 4.0.0 / 1.11.0 / 0.18.1 / 0.18.4 |
+| triton / tokenizers / safetensors / sentencepiece / einops | 3.4.0 / 0.22.2 / 0.5.3 / 0.2.2 / 0.8.1 |
+| 推理/其它 | vllm 0.11.0 / bitsandbytes 0.50.2 |
 
-**flash-attn 的装法**（这机器上不需要源码编译，别去 build）：GitHub releases 上有和本环境
-逐项对齐的预编译 wheel（cp311 + torch2.6 + cu12 + **cxx11abiFALSE** + linux_x86_64，
-180MB，实测下载 113 MB/s）。注意 **wheel 发在 `v2.7.4.post1` 那个 release 里，
-`v2.7.4` 本体的 assets 是空的**：
+⚠️ 一个小瑕疵：`import vllm` 会警告 `torchao 0.15.0` 与 `torch 2.8.0` 不兼容（缺 torchao 的
+编译扩展）。**只影响 torchao 那部分量化路径，vllm 本身能 import** —— 阶段 4 若要批量算
+loss 用它，先在小样本上验一遍。
 
-```bash
-# 安装时务必 --no-deps，否则 pip 会去"修" torch / transformers
-pip install --no-deps \
-  https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+### 8.1 LLaMA-Factory 的接线方式
+
+框架是 submodule（`submodules/LLaMA-Factory`，**0.9.5**），用**符号链接**接回来：
+
+```
+/volume/data/hjiang02/workspace/LLaMA-Factory -> .../ScalingLaw/submodules/LLaMA-Factory
 ```
 
-选 wheel 的四个字段要和环境对上：`cp311`（python 3.11）、`torch2.6`、`cu12`、
-`cxx11abiFALSE`（用 `python -c "import torch;print(torch._C._GLIBCXX_USE_CXX11_ABI)"` 查）。
-装完已复验 torch / transformers 版本未被改动。wheel 副本留在
-`/opt/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl`。
+之所以需要这条链接：早期 pip 以 editable 方式装过 LLaMA-Factory，其 `.pth` 指向
+`.../workspace/LLaMA-Factory/src`。submodule 没 init 时该路径不存在，`import llamafactory`
+直接失败。**新 clone 后必须 `git submodule update --init --recursive` 再做这条符号链接**，
+否则 CLI 起不来。
+
+### 8.2 版本错位是已知且无害的
+
+| 包 | 装了的 | LLaMA-Factory 0.9.5 声明 | 实测 |
+|---|---|---|---|
+| transformers | **5.8.0** | `<=5.6.0` | ✅ 正常（0.9.6.dev0 的上界正好是 5.8.0） |
+| datasets | 4.0.0 | `<=4.0.0` | ✅ |
+| accelerate | 1.11.0 | peft 要求 `<=1.11.0` | ✅ |
+| peft | 0.18.1 | `<=0.18.1` | ✅ |
+| torchdata | 0.11.0 | `<=0.11.0` | ✅ |
+
+各依赖**全部卡在自己允许区间的上界** —— 这是平台有意锁的版本矩阵，动一个就会连锁崩。
+transformers 5.8.0 超出 0.9.5 声明的 `<=5.6.0`，但**实测功能正常**（0.9.6.dev0 才把上界
+提到 5.8.0，说明 5.8.0 本身没有破坏性改动）。**因此不要按 0.9.5 的声明去降级
+transformers** —— 那会把 torch/accelerate 一起拖下水。需要时用 `DISABLE_VERSION_CHECK=1`
+跳过运行时版本告警。
+
+⚠️ **不要 `pip install -e .` LLaMA-Factory**，同理**不要 `pip install -r` 它的 requirements**：
+两者都会按 pyproject 重新解析依赖，把上面这个矩阵改掉。
+
+### 8.3 曾经的失败路线（别再走一遍）
+
+1. **容器重建会抹掉 overlay**：这个项目已经因此丢过一次整个 `/opt/miniconda3`（torch 2.6.0
+   + flash-attn 2.7.4 那套自建环境）。**别把环境建在 `/opt`、`/root`、`/tmp` 这些
+   overlay 路径上**。平台镜像里的 `/usr/bin/python3` 不在这个风险里
+2. **自己装 flash-attn 是多余的**：环境已带 2.8.3。若真要从零装（比如换个 torch 版本），
+   走预编译 wheel，**别去 build 源码**；`pip install` 时务必 `--no-deps`，否则 pip 会去
+   "修" torch / transformers。wheel 文件名四个字段要和环境逐项对齐：
+   `cp312` + `torch2.8` + `cu12` + `cxx11abiFALSE`
+   （`python -c "import torch;print(torch._C._GLIBCXX_USE_CXX11_ABI)"`）
+3. **conda 26.x 的 ToS**：非交互 `conda create` 会要求 accept `repo.anaconda.com` 服务条款，
+   而这是法律层面由你自己做的同意，我不代 accept
 
 **已实测训练闭环**：用 `models/configs/pythia-14m` 的 config 建模型（参数
-**14,067,712**，与官方 pythia-14m 完全一致），在 GPU 上 loss 从 **10.85** 起步并正常下降。
-`ln(50304) = 10.83` 正是随机初始化的理论值 —— 说明 tokenizer 与初始化都正确。
-
-⚠️ 四个坑：
-
-1. **持久性**：`/opt` 在容器 overlay 层，**容器被驱逐/重建会连同环境一起丢失**（这个项目
-   已经因此丢过一次记录）。理想位置是 `/volume/data/hjiang02/`（持久）但配额满。
-   **拿到配额后应把 miniconda 迁过去重建**，约十分钟
-2. **conda 26.x 的 ToS**：非交互 `conda create` 会要求 accept `repo.anaconda.com` 服务条款；
-   当时未代 accept（法律层面的同意不宜代做），改走 conda-forge
-   （`--override-channels -c conda-forge`）。故该环境基础包来自 conda-forge 而非 defaults。
-   若要用 defaults 的包，需自己先跑 `conda tos accept`
-3. **transformers 版本必须锁**：LLaMA-Factory v0.9.5 要求 `>=4.55.0,<=5.6.0,!=4.52.0,!=4.57.0`。
-   PyPI 默认给 5.x，**装完务必 `pip list | grep transformers` 复查**
-4. **LLaMA-Factory 尚未安装**（submodule 未 init）。装它时会按 pyproject 重新解析依赖
-   （含 `torchdata>=0.10.0,<=0.11.0` 等当前未装的包），**可能再改 transformers 版本** ——
-   装完必须复查版本仍在允许区间内
+**14,067,712**，与官方 pythia-14m 完全一致），在 GPU 上 loss 从 `ln(50304) = 10.83`
+附近（10.77）起步并正常下降 —— 说明 tokenizer 与初始化都正确。4 卡
+（`FORCE_TORCHRUN=1`）实跑 exit 0，NCCL 总线带宽 281.5 GB/s。
 
 ## 9. 关键参考
 
