@@ -1,19 +1,45 @@
 # Chinchilla 缩放律复现计划
 
-复现 Hoffmann et al. 2022《Training Compute-Optimal Large Language Models》(arXiv:2203.15556)
-的**核心方法论**——用 isoFLOP 剖面测出 `N_opt ∝ C^a`、`D_opt ∝ C^b`，检验 `a ≈ b ≈ 0.5`。
+## 这份计划要做什么：**先测，再看结论**
 
-模型架构用 **GPT-NeoX**(对齐 Pythia 系列)，**以 `EleutherAI/pythia-14m` 为模板**：只取其
-config + tokenizer，尺寸通过改 4 个字段往上派生，配 `train_from_scratch: true` 从零初始化。
-选 Pythia 作模板不是为了"复现 Pythia"，而是因为它是这批模型里**唯一有官方公开权重和完整
-训练曲线**的家族，可以拿来做独立交叉验证。
+我们**在动手之前不去读 Chinchilla 的最终答案**。所有超参、尺寸、token 预算都由自己
+的实验设计推出来；论文的 (0.49, 0.51)、20 tok/param、`√(C/120)` 这些东西**只允许在
+最后一步拿来对照**，不允许用来决定实验怎么跑。
 
-## 0. 先明确这个计划能给什么、不能给什么
+理由很实在：如果先知道"答案应该是 0.5，而且谷底在 20 tok/param"，那么每一步都会不自觉
+地朝那个方向调——
+
+- 谷底没出来，就会想"再补个点应该就有了"，而不是记录下来"这里没有谷底"
+- 拟合出 0.42，就会想"是不是 LR 没调好"，而不是问"0.42 是不是真实结果"
+- 试到第 3 个 token 预算时，已经知道该往哪边挪，等于把答案喂给了过程
+
+这种做法测出来的**不是缩放律，是"我能不能调出论文那个数"**。而缩放律的价值恰恰在于它是
+一条**先验未知、可被证伪**的经验规律；先看答案会让实验失去证伪能力。
+
+### 具体怎么保证
+
+| 规矩 | 为什么 |
+|---|---|
+| **超参独立定**：LR / batch / β2 / warmup 全按自己测出来的最优值定（阶段 2 的扫描），不抄论文 | 抄了就把论文的结论引进来了 |
+| **预算与尺寸网格先写死再跑**：§3 的网格一旦定稿就冻结，跑完再改 | 防止"看到中间结果就调网格"这种事后选择 |
+| **允许也鼓励出现非 0.5 的结果**：`a` 落在 0.6~0.9 是**有效发现**，不是 bug | Porian et al. 的实测就是调参不足会系统性偏大 |
+| **每一档预算都留存原始 loss**：`runs/*/summary.json` 与 `trainer_log.jsonl` 全留 | 事后想换口径/换拟合方式时，不用重跑 |
+| **论文结论只在 §6 做对照**，不参与任何决策 | 对照是终点，不是起点 |
+
+⚠️ 一个必须诚实面对的后果：**这样做出来的指数很可能不是 0.5**。算力跨度只有 16×（§3），
+`vocab=50304` 又让 embedding 在小模型端占到 91.5%（§3 的口径敏感性）。若最后测出
+`a ≈ 0.4` 或 `a ≈ 0.7`，**正确做法是把测量值连同不确定性一起报出来、并分析为什么偏移**，
+而不是回头把网格调到"能出 0.5 为止"。这份计划的目标是**做一次诚实的测量**。
+
+---
+
+## 0. 这个计划能给什么、不能给什么
 
 **能给：**
-- 指数 `(a, b)` 的测量值，与论文的 (0.49, 0.51) 对比
-- `L(N,D) = E + A/N^α + B/D^β` 的拟合（Approach 3）
+- 指数 `(a, b)` 的**测量值**（含置信区间），**以及它是否等于 0.5 这个检验结果**
+- `L(N,D) = E + A/N^α + B/D^β` 的拟合
 - 一条属于自己算力预算的 compute-optimal 曲线
+- 若与论文不符：**差异归因**（是调参不足？是 embedding 口径？是算力跨度太窄？）
 
 **不能给：**
 - 论文的绝对 loss 数值 —— MassiveText **未公开**，不可复现。论文模型卡原文：
@@ -22,8 +48,13 @@ config + tokenizer，尺寸通过改 4 个字段往上派生，配 `train_from_s
   的信息量，即改变了有效 `D`
 
 **关键推论**：既然绝对数值注定对不上，架构上追求"忠实于 Gopher/Chinchilla"就买不到可比性。
-且指数对架构是弱敏感的（论文 App. C 演示了跨数据集指数几乎不动）。**所以架构选型是工程
-效率问题，不是保真度问题。**
+且指数对架构是弱敏感的（跨数据集对照实验显示指数几乎不动）。**所以架构选型是工程效率
+问题，不是保真度问题。**
+
+模型架构用 **GPT-NeoX**(对齐 Pythia 系列)，**以 `EleutherAI/pythia-14m` 为模板**：只取其
+config + tokenizer，尺寸通过改 4 个字段往上派生，配 `train_from_scratch: true` 从零初始化。
+选 Pythia 作模板不是为了"复现 Pythia"，而是因为它是这批模型里**唯一有官方公开权重和完整
+训练曲线**的家族，可以拿来做交叉验证（**注意：是验证实现有没有写错，不是校准指数**）。
 
 ## 1. 环境事实（2026-09-24 实测，已验证可训练）
 
@@ -139,24 +170,51 @@ batch / seq / 宽度。
 4. ⚠️ **口径**：目录名用**总参数量**（pythia/HF 命名口径），阶梯按**非 embedding**参数量定。
    这个区分必须记住 —— `pythia-14m` 名义 14M，但其中 12.9M 是词表，计算层只有 1.2M
 
-## 3. 实验网格（待定稿）
+## 3. 实验网格（⚠️ **必须定稿并冻结后再开跑**）
 
-isoFLOP 剖面法的要求：每个预算 `C` 下扫一串尺寸，**必须有一个尺寸落在 `N_opt` 两侧**
-（否则抛物线没有顶点，测不出最优点）。
+isoFLOP 剖面法：每个预算 `C` 下扫一串尺寸，用最终 loss 拟合抛物线，**顶点**就是该预算下的
+最优点 `N_opt(C)`。再对 `(C, N_opt)` 拟合幂律得到 `a`。
 
-上一版网格（Chinchilla Table A9 尺寸梯）已废弃，因为 A9 的尺寸与我们这条 pythia 阶梯无关。
-**新版网格待定**，需要：
-- 选定 3~4 个 isoFLOP 预算 `C`
-- 每个 `C` 从 §2 的 7 档里挑 4~5 档，保证跨过 `N_opt = √(C/120)` 两侧
-- token 数由 `D = C/(6N)` 反推，**cosine 周期长度必须精确等于 `max_steps`**
-  （论文 App. B：超出 25% 性能明显下降）
+### 3.1 网格怎么定
 
-⚠️ 注意 `N` 的口径与 §2 一致（建议用 `N_总`，因为 `C = 6ND` 的 `C` 是含 embedding 的算力；
-论文原文："We include all training FLOPs, including those contributed to by the embedding
-matrices" 以及 "we also count embeddings matrices in the total parameter count"）。
-但我们 vocab 是 50304（比论文 32k 大 1.57 倍），小模型端 embedding 占比会到 74~92%，
-论文"embedding 贡献很小"的前提在小端**不成立** —— 这里要做敏感性分析：两个口径各算一遍，
-看谷底位置移动多少。
+- 选定 **3~4 个 isoFLOP 预算 `C`**（量级拉开，见下）
+- 每个 `C` 从 §2 的 7 档里挑 **4~5 档**尺寸
+- token 数由 `D = C/(6N)` 反推；`max_steps` 由 `D` 和每步 token 数算出，
+  **cosine 周期必须精确等于 `max_steps`**（`train_abl.py` 已固定这个行为）
+
+### 3.2 ⚠️ 尺寸跨度要靠**参数密度**保证，不能靠感觉
+
+抛物线要能定出顶点，**必须让尺寸跨过最优点两侧**。但"最优点在哪"正是我们要测的——所以
+选尺寸时**不能**假设谷底落在某个 token/param 比值上（那等于把答案预先塞进设计里）。
+
+可用的判据是**参数密度**：同一预算 `C` 下，一个尺寸如果 `N` 太小，它会训练得"欠拟合"
+（loss 高）；如果 `N` 太大，token 太少也"欠训练"（loss 也高）；中间存在最低点。所以
+设计网格时按**参数密度 `C/N³` 由稀到密铺开**（即从"小模型、很多 token"到"大模型、很少
+token"），让几何上确实存在一个内部极小值，而不去猜它在哪。
+
+**实操**：每个预算下先跑 4 档，拟合看有没有内部极小。**若单调（没有谷）就补点**——
+`train_abl.py` 能随时补单个 run，不必重跑已有的。补点必须基于"几何上还不够宽"这个理由，
+不能基于"我猜谷应该在那边"。
+
+### 3.3 ⚠️ 算力口径必须两个都记
+
+`budget.json` / `summary.json` 里同时存了两个口径（`train_abl.py` 自动算）：
+
+```
+C_total  = 6·N_total·D      ← N 含 embedding（论文的 C = 6ND 用这个）
+C_nonemb = 6·N_nonemb·D     ← 彻底排除 embedding
+```
+
+**两者在 14m 上差 11.8 倍**（embedding 占 91.5%），在 1.2b 上只差 1.2 倍。所以"用哪个
+口径"会**系统地改变谷底位置**，尤其在小模型端——这是本实验一个真实的不确定性来源，
+必须两个都拟合、把差异报告出来，而不是选一个更"好看"的。
+
+（论文把 embedding 算进 N，但它的 vocab 只有 32k 且模型都很大，所以这个选择在它那里
+几乎无影响；我们 vocab=50304 且要跑到 14m 这种尺寸，论文的前提在**小端不成立**。）
+
+⚠️ **绝对不要用 HF 的 `total_flos`** —— 它是 `6 × num_parameters(exclude_embeddings=True) × D`，
+在 `tie_word_embeddings=False` 时只排除了一个 embedding，既非 `N_total` 也非 `N_nonemb`，
+且偏差随尺寸变化（14m 0.542 → 1.2b 0.920）。详见 §9.5。
 
 ## 4. 数据（✅ 已就绪）
 
@@ -191,16 +249,22 @@ matrices" 以及 "we also count embeddings matrices in the total parameter count
 用的 Pythia tokenizer 不同。抽样 3000 条实测**偏差只有 1.0033 倍（≤0.4%）**，所以直接拿
 它做预算，不必为了数 token 把 282G 跑一遍（盘点 150 个分片只要 66 秒）。
 
-为什么不需要凑 math/code 配比：论文 **App. C / Table A2** 专门做了跨数据集对照——单用 C4 得
-`(a,b)=(0.50,0.50)`，单用 GitHub code 得 `(0.53,0.47)`，与主结论一致。论文结论：
-**只要训练不超过 1 个 epoch，缩放律与数据集无关。**
+**为什么可以直接用这一份、不额外凑 math/code 配比**：本实验测的是"在**固定数据集**上
+`N` 与 `D` 的最优配比"，不是"数据集如何影响缩放律"——那是另一个问题。所以只要语料
+①在 100B 量级 ②质量大体均匀 ③不重复，我们的对照就在内部自洽：所有尺寸吃的是同一份
+数据的**不同切片**（按 run 名做种子，互不重叠），数据集这个变量被控制住了。
 
-100BT 是**单次 run** 的上限（超过 1 epoch 就要引入 datablock 的重复数据修正），
-多个 run 可以复用同一份语料（每个 run 按 run 名做种子取**不同切片**，互不重叠）。
+⚠️ 这里刻意**不引用**任何"缩放律与数据集无关"之类的现成结论来给这个选择背书——
+那是待检验的命题，不该当成设计前提。如果最后各尺寸的 loss 有异常，**"切片之间难度不均"
+是必须排查的嫌疑之一**（`runs/*/budget.json` 里记了每档用了哪些分片，可回溯）。
 
-⚠️ **磁盘**：`/volume/data` 配额**长期只剩 <1G**。语料本身已经在盘上（不用再占），但
-每个 run 的框架输出要 58~92M（其中 `out/model.safetensors` 占绝大多数）。跑网格前必须
-处理：要么清掉旧 run，要么申请配额放开。**`pythia-1.2b` 那档权重 4.8G，现在一定写不下。**
+100BT 是**单次 run** 的上限（超过 1 epoch 就要引入重复数据的修正），
+多个 run 可以复用同一份语料。
+
+⚠️ **磁盘**：`/volume/data` 配额**长期只剩 <1G**。语料已在盘上（不额外占），且
+`train_abl.py` 训练后会自动删掉权重等大件，**单个 run 现在只占 ~0.4M**（实测
+`test-prune-14m` 362K，清理掉了 59.9M = 99.7%）。跑网格前仍建议清掉旧 run，
+并注意 `1.2b` 档在**训练期间**仍需要足够空间写临时权重（约 4.8G）。
 
 ## 5. 实施步骤
 
@@ -230,41 +294,71 @@ matrices" 以及 "we also count embeddings matrices in the total parameter count
 
 ### 阶段 2：**按尺寸调 batch / LR / β2**（~1 周）⚠️ 不可跳过
 
-**这是整个计划最容易失败的地方。** 论文没有公布每个尺寸的 LR/batch/β2（App. D.1 只给了
-max LR 区间 2e-4 小 → 1.25e-4 大）。Porian et al. 2024 (arXiv:2406.19146) 的实测结论：
-**小尺度上若不按尺寸调这三项，拟合出的 `a` 会系统性偏大到 0.6~0.9，复现不出 0.5。**
+**这是整个计划最容易失败的地方，而失败方式是"悄悄把指数推偏"。** 若不做这一步，各尺寸
+会各自处在不同的"调参质量"下，于是 loss 的差异里混进了超参差异，拟合出的指数就不再是
+模型规模的函数 —— 而是调参质量的函数。
 
-要调的（对每个尺寸，用最短的预算短跑几个点）：
-- **batch size（按 token 计）**：随模型增大而增大
-- **max LR**：经验上 `LR ∝ 1/width`；起点用论文区间，在各自尺寸上扫 3 个值
-- **AdamW β2**：Porian 指出 β2=0.95 在小 batch(≤128) 下不是最优，**要用 0.99/0.999**
-- **grad clip 1.0**（论文 Gopher §3.2；7.1B 以上降到 0.25）
-- **warmup**：论文用固定 1500 步；Porian 建议 warmup tokens ≈ N，小模型上按后者更稳
+**这一步的正确做法是自己扫，不要抄论文的数**（理由见文档开头）：对每个尺寸，用最短的
+预算短跑几个点，扫出各自的 LR / batch / β2，**以"该尺寸 loss 最低"为唯一判据**。
+
+要调的（每个尺寸都单独扫）：
+- **batch size（按 token 计）**
+- **max LR**：在各自尺寸上扫 3 个值，取 loss 最低者
+- **AdamW β2**：小 batch 下 β2 取大（0.99/0.999）通常更稳；仍以实测为准
+- **grad clip**：先用 1.0
+- **warmup**：`warmup tokens ≈ N` 是个合理起点，但同样要验
 - ⚠️ **初始化**：HF 的 `GPTNeoXPreTrainedModel._init_weights` 对**所有尺寸**都用固定
   `initializer_range=0.02`，**没有** EleutherAI 原实现里 `1/√(2L)` 的残差输出缩放。
   含义：① 大 `L` 档若 loss 一开头就炸，先怀疑 init 而不是自己写错了；② 在 HF 里
   from-scratch 训出来的模型与 pythia 官方权重**不是同一套 init 方案**，交叉验证要留这个偏差
 
+⚠️ **记下每个尺寸最终选了什么**。若最后指数偏了，第一件要查的就是"各尺寸的调参是否同等
+充分"——所以调参过程本身也要留证据（`runs/` 里逐 run 都有 `train.yaml`）。
+
 ### 阶段 3：跑满网格（随预算）
-生成配置后逐个跑。**每跑完一个尺寸就立刻拟合抛物线**，不要等全部跑完——如果发现某条曲线
-没有顶点（阶梯没跨过最优点），要能及时补点而不是返工。
+按 §3 定稿的网格逐个跑。**每跑完一个尺寸就立刻拟合抛物线**，看有没有内部极小；
+**若单调就补点**（补点的理由是"几何上跨度不够"，不是"我猜谷在那边"）。
 
 ### 阶段 4：拟合与对照（~2 天）
 - 每条 isoFLOP 曲线拟合抛物线 → 顶点即 `N_opt(C)`、`D_opt(C)`
-- 对 `(C, N_opt)` 和 `(C, D_opt)` 拟合幂律 → 得到 `(a, b)`
-- 用全部终点 loss 拟合 `L(N,D) = E + A/N^α + B/D^β`（Approach 3）
-- 对照：论文 Approach 2 的 (0.49, 0.51)；Epoch AI 复现的修正指数 (α≈β≈0.35)
+  - **两个算力口径各拟合一遍**（`C_total` 与 `C_nonemb`，见 §3.3），报告差异
+- 对 `(C, N_opt)` 和 `(C, D_opt)` 拟合幂律 → 得到 `(a, b)`，**给出置信区间**
+- 用全部终点 loss 拟合 `L(N,D) = E + A/N^α + B/D^β`
+- **到这里才可以翻论文**：对照它的指数、Epoch AI 复现的修正指数
+- **若不符，做归因**（这是有价值的产出，不是失败）：
+  ① 各尺寸调参是否同等充分（阶段 2 的记录）
+  ② 算力跨度是否太窄（§3.2）
+  ③ embedding 口径把谷底挪了多少（§3.3）
+  ④ 是否超了 1 个 epoch
 
 ## 6. 怎么判断"做成了"
 
-| 检查项 | 期望 | 说明 |
-|---|---|---|
-| 每条 isoFLOP 曲线有明确 U 形谷 | 必须 | 没有谷 = 阶梯没跨过最优点，补点重跑 |
-| 拟合出的 `a`、`b` | 落在 0.4~0.6 | 论文 0.49/0.51；偏差大先怀疑阶段 2 没调好 |
-| `a + b ≈ 1` | 应成立 | 由 `C = 6ND` 约束推出的守恒关系 |
-| `a ≈ b` | 应成立 | 即 20 tok/param 的由来 |
+**先分清"实验做对了"和"结论是什么"**——这两件事必须分开评价。做对了是过程合格；
+结论是什么是测量结果。**不能因为结论不是 0.5 就判定实验失败。**
 
-**若 `a` 落在 0.6~0.9**：几乎一定是阶段 2 的按尺寸调参没做够（Porian 的结论），不是实现 bug。
+### 6.1 过程合格（这些是硬要求）
+
+| 检查项 | 要求 | 说明 |
+|---|---|---|
+| 网格定稿先于开跑 | 必须 | §3 冻结后才开跑，中途不改（补点除外，且理由须是"跨度不够"） |
+| 每条 isoFLOP 曲线有内部极小 | 必须 | 单调 = 跨度不够，按 §3.2 补点。**但不许为了凑出谷而反复挪网格** |
+| 各尺寸调参同等充分 | 必须 | 阶段 2 的记录可查：每个尺寸都是各自扫出来的最优 |
+| 原始 loss 留存 | 必须 | `runs/*/summary.json` + `trainer_log.jsonl` 全留，别人可复算 |
+| 报告不确定性 | 必须 | 指数给置信区间；两个算力口径的差异一并报 |
+
+### 6.2 结论（**开放，不预设**）
+
+| 量 | 我们测出来是多少就是多少 | 事后对照用的参考值 |
+|---|---|---|
+| `a`、`b` | **待测** | 文献里出现过 0.49/0.51、0.35/0.35 等不同值，本身就说明它依赖实验设置 |
+| `a + b` | **待测** | 由 `C = 6ND` 约束，理论上是 1 |
+| tok/param | **待测** | 文献有 20 的说法 |
+| 谷的尖锐程度 | **待测** | 越平 = 该预算下最优尺寸越不确定，这本身是结论 |
+
+⚠️ **若 `a` 落在 0.6~0.9**：文献（Porian et al.）指出这通常意味着各尺寸调参不够充分。
+**先查阶段 2 的记录**再下结论——但要把它当作一个**已记录的偏差**正常报告，
+而不是"没复现出来所以再调调看"。查询归查询，不许据此重选网格。
+**诚实的负面结果也是结果。**
 
 ## 7. 目录结构
 
@@ -371,42 +465,63 @@ transformers** —— 那会把 torch/accelerate 一起拖下水。需要时用 
 
 ## 9. 一次实验的产物说明（`runs/<run 名>/`）
 
-`train_abl.py` 跑完一个 run 后，产物全部落在 `runs/<run 名>/` 下。**每个 run 自带全部
-证据**，事后不用回忆当时怎么跑的。分组如下：
+`train_abl.py` 跑完一个 run 后，产物落在 `runs/<run 名>/` 下。**每个 run 自带全部证据**，
+事后不用回忆当时怎么跑的。
 
 ### 9.1 我们生成的（复现与口径的依据）
 
 | 文件 | 是什么 | 为什么留着 |
 |---|---|---|
 | `train.yaml` | 完整的 LLaMA-Factory 配置 | **可直接重跑**；也是"当时到底用了什么超参"的唯一权威 |
-| `budget.json` | `N_total`/`N_nonemb`/`D`/`C=6ND`/`tokens_per_step`/`steps`/`tok-per-param` | **阶段 4 拟合的输入**——横轴 `C` 和纵轴 `loss` 都从这里取 |
+| `budget.json` | `N_total`/`N_nonemb`/`D`/`C_total`/`C_nonemb`/`tokens_per_step`/`steps`/两种 tok-per-param | **阶段 4 拟合的输入**——横轴 `C` 和纵轴 `loss` 都从这里取 |
 | `data/dataset_info.json` | 本次语料的数据集配置（`columns.prompt=text` 等） | 记录数据是怎么接进去的 |
 | `data/raw/shard_NNNN.parquet` | **软链接**，指向 `open_source/.../100BT/` 里的真实分片 | 记录"这次到底喂了哪些分片"；不拷贝，282G 语料只存一份 |
 | `loss.png` | loss-vs-step + loss-vs-tokens 双面板曲线 | 一眼看收敛形状 |
-| `summary.json` | 首/末/尾部均值/最小 loss、步数、token 数 | 阶段 4 汇总时不用重读 parquet |
+| `summary.json` | 首/末/尾部均值/最小 loss、`N`/`D`/两种 `C` | 阶段 4 汇总时不用重读 parquet |
 | `train.log` | 框架完整 stdout | 出问题时唯一的现场 |
 
 ### 9.2 框架自己写的（`out/` 下，**不要手改**）
 
 | 文件 | 是什么 | 备注 |
 |---|---|---|
-| `out/trainer_log.jsonl` | **逐点 loss/lr/epoch，每步一行（追加写）** | ★ `loss.png` 就是从它画的；**所以上报通道挂了曲线也不丢**。注意是追加写，所以 `output_dir` 必须逐 run 分开 |
-| `out/trainer_state.json` | HF 的完整训练状态（含 `log_history`、`global_step`、`total_flos`） | 比 jsonl 更全，但结构嵌套 |
-| `out/train_results.json` | 收尾汇总：`train_loss`/`train_runtime`/`samples_per_second`/`total_flos` | `total_flos` 有个口径坑，见 §9.4 |
-| `out/all_results.json` | 同上的副本（HF 给"所有阶段结果"留的位置） | — |
+| `out/trainer_log.jsonl` | **逐点 loss/lr/epoch，每步一行（追加写）** | ★ **loss 的唯一必需来源**，`loss.png` 与 `summary.json` 都从它来；上报通道挂了也不丢。追加写 → `output_dir` 必须逐 run 分开 |
+| `out/trainer_state.json` | HF 的完整训练状态（含 `log_history`、`grad_norm`、`total_flos`） | 与 jsonl 的 step/loss 相同，但多 `grad_norm`；结构嵌套 |
+| `out/train_results.json` | 收尾汇总：`train_loss`/`train_runtime`/`samples_per_second`/`total_flos` | `total_flos` **别用**，见 §9.5 |
 | `out/runs/*/events.out.tfevents.*` | TensorBoard 事件（`report_to: tensorboard`） | 本地 loss 的第二份记录 |
-| `out/model.safetensors` | **最终模型权重** | ⚠️ **磁盘大户，且无条件写入**（`pt/workflow.py:64` 的 `trainer.save_model()`）—— 14m 就 54M，1.2b 约 4.8G。`--save-final` 管不了它，只控制中间检查点。拟合只需 loss，这是盘上唯一值得关注的大件 |
-| `out/config.json` `generation_config.json` `tokenizer.json` `tokenizer_config.json` `chat_template.jinja` | **被框架改写过的**模型配置与分词器（不是源文件的拷贝） | 实测 `config.json` 被 transformers 5.8.0 按新 schema 重写（`rope_scaling`→`rope_parameters` 等）；`tokenizer.json` 加了 `pad_token`。**实测分词结果与源逐 token 一致**，无影响 |
-| `out/README.md` | 自动生成的模型卡 | `base_model` 只是指向 `models/configs/pythia-14m` 的**指针**，不是副本 |
-| `out/checkpoint-*/` | 中间检查点（`--save-final` 时才出现） | 含 `rng_state_*.pth`，逐卡一份；默认**不存** |
+| `out/swanlab_public_config.json` | 指向 `runs/_swanlab/run-...` 的**指针** | 关联键是 `run_id` |
 
-**重合度实测**（`runs/test-14m-e2e`）：run 根与 `out/` **文件名零重合**；内容上只有两处重叠 ——
-`train_results.json` ≡ `all_results.json`（md5 相同，各 219 字节），以及
-`trainer_log.jsonl` 与 `trainer_state.json` 的 `log_history`（504 个点的 step/loss 完全相同，
-但键互补：jsonl 多 `elapsed_time`/`percentage`，state 多 `grad_norm`）。
-**没有值得清理的重复** —— run 根 348K 中 99% 是 `loss.png`+`train.log`，`out/` 58M 中 97% 是权重。
+**被删掉的**（见 §9.3）：`model.safetensors`、`*.bin`、`tokenizer.json`、`config.json`、
+`generation_config.json`、`chat_template.jinja`、`README.md`、`all_results.json`、`checkpoint-*/`。
 
-### 9.3 swanlab
+### 9.3 训练结束后会自动删掉权重（run 目录只剩 ~250K）
+
+LlaMA-Factory **没有任何开关能跳过存权重**（`pt/workflow.py:64` 的 `trainer.save_model()`
+是无条件调用，且未 override HF 原生实现）。而本实验只需要 **loss-vs-C**，权重完全用不上，
+14m 就要 54M、1.2b 要 4.8G —— 配额只剩几百 M，不删必然撑爆。
+
+所以 `train_abl.prune_run_artifacts()` 在**出图之后**清掉与缩放律无关的大件：
+
+| 删掉 | 为什么不需要 |
+|---|---|
+| `model.safetensors`、`*.bin` | 权重，拟合用不到（要留就加 `--keep-model`） |
+| `tokenizer.json`（3.5M） | 分词器副本，`models/configs/` 里已有 |
+| `config.json`、`generation_config.json`、`chat_template.jinja` | 被框架改写过的副本；原始 config 在 `models/configs/` |
+| `README.md` | 自动生成的模型卡，无手写内容 |
+| `all_results.json` | `train_results.json` 的孪生副本（md5 相同） |
+| `checkpoint-*/` | 中间检查点（默认本来就不存） |
+
+| 保留 | 为什么必须留 |
+|---|---|
+| `trainer_log.jsonl` | **loss 的唯一必需来源** |
+| `trainer_state.json` | 含 `grad_norm`（jsonl 没有），排查训练异常要看 |
+| `train_results.json` | 收尾汇总 |
+| `out/runs/*/events.out.tfevents.*` | TensorBoard 记录，只有 ~30K |
+| `train.yaml` / `budget.json` / `loss.png` / `summary.json` / `train.log` | 见下 |
+
+**实测**（`runs/test-prune-14m`）：删 9 项释放 **59.9M**（占 99.7%），run 目录从 60M 降到
+**362K**。权重只在**训练期间**占盘，跑完即释放。
+
+### 9.4 swanlab
 
 `runs/_swanlab/` 是 **local 模式的落盘目录，被所有 run 共享**（不是每个 run 一份）：
 
@@ -415,32 +530,51 @@ transformers** —— 那会把 torch/accelerate 一起拖下水。需要时用 
   `_swanlab/` 下的哪个子目录（`run_id` 就是关联键）
 - 云端模式下 `_swanlab/` 仍会生成一份本地缓存，作为上传失败的兜底
 
-### 9.4 ⚠️ 两个口径坑（都已在代码里处理，这里备查）
+### 9.5 ⚠️ 算力口径：**全部由我们自己算**，不信任库给的数
 
 **坑 1：`tokens_per_step` 必须乘 `world_size`。** 漏掉 GPU 数会让实际 `D` 只有预期的
 1/4，isoFLOP 剖面直接废掉。已在 `train_abl.plan_budget` 里固定。
 
-**坑 2：HF 的 `total_flos` 不能当成 `C = 6ND` 用。** 实测（transformers 5.8.0，
-`trainer.py:3900`）HF 的口径是：
+**坑 2：HF 的 `total_flos` 不能当成 `C = 6ND` 用，所以干脆不用它。**
+实测（transformers 5.8.0，`trainer.py:3900`）HF 的口径是：
 
 ```
 6 × num_parameters(exclude_embeddings=True) × tokens
 ```
 
 而 `exclude_embeddings=True` 在 `tie_word_embeddings=False` 时**只排除了输入
-embedding，LM head 仍被算进去** —— 于是它既不是论文的 `N_total` 也不是真正的
-non-embedding，是个中间量。危害在于**偏差随尺寸变化**：
+embedding，LM head 仍被算进去**。实测：
 
-| 尺寸 | `N_total` | HF 口径 / 论文口径 |
+| 量 | 值 | 是什么 |
 |---|---|---|
-| `pythia-14m` | 14.1M | **0.542** |
-| `pythia-86m` | 86.2M | 0.701 |
-| `pythia-442m` | 442.0M | 0.862 |
-| `pythia-1.2b` | 1.21B | **0.920** |
+| `num_parameters()` | 14,067,712 | = `N_total`，与我们的公式一致 ✓ |
+| `num_parameters(exclude_embeddings=True)` | 7,628,800 | = `N_total − vocab·d`，**中间量** |
+| 我们算的 `N_nonemb` | 1,189,888 | 真正排除两个 embedding |
 
-从 14m 到 1.2b 差了 **1.7 倍**。若拿 `total_flos` 当横轴 `C`，小模型会被系统性压向
-一侧，**直接扭曲拟合出的指数 `a`** —— 而且因为偏差是尺寸相关的，它不会表现为一个
-可辨识的常数偏移，很难事后发现。
+所以 HF 那个数**既非 `C_total` 也非 `C_nonemb`**。危害在于偏差随尺寸变化：
+
+| 尺寸 | HF 口径 / `C_total` |
+|---|---|
+| `pythia-14m` | **0.542** |
+| `pythia-86m` | 0.701 |
+| `pythia-442m` | 0.862 |
+| `pythia-1.2b` | **0.920** |
+
+从 14m 到 1.2b 差 **1.7 倍**。若拿它当横轴 `C`，小模型会被系统性压向一侧，**直接扭曲
+拟合出的指数 `a`** —— 且因为是尺寸相关的偏差、不是常数偏移，很难事后发现。
+
+**对策**：`train_abl.param_counts()` 直接按公式从 `config.json` 拆参数
+（`N_非emb = 12Ld² + 13Ld + 2d`，`N_总 = N_非emb + 2·vocab·d`），
+`plan_budget()` 据此算出**两个**算力口径写进 `budget.json`：
+
+```
+flops        = 6·N_total·D     ← 主口径（论文把 embedding 算进 N）
+flops_nonemb = 6·N_nonemb·D    ← 敏感性分析口径（彻底排除 embedding）
+```
+
+`log_flops_calibers()` 每次 run 打印两者比值，并**对照** HF 的 `total_flos` 提醒它
+落在哪儿（实测比值与预测 `1 − vocab·d/N_total` 完全吻合）。`plot_run.summarize()` 也只从
+`budget.json` 取口径，绝不读 `train_results.json` 的 `total_flos`。
 
 **所以横轴一律用 `budget.json` 里的 `flops`（= `6·N_total·D`，论文口径）。**
 `train_abl.warn_flos_trap` 每次 run 都会把两者的比值打出来提醒（实测比值与预测

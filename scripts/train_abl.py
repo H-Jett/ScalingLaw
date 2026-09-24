@@ -44,6 +44,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -82,14 +83,16 @@ def param_counts(model_dir: Path) -> dict:
     layers = int(cfg["num_hidden_layers"])
     vocab = int(cfg["vocab_size"])
     nonemb = 12 * layers * d * d + 13 * layers * d + 2 * d
-    total = nonemb + 2 * vocab * d
+    vocab_emb = vocab * d  # 单个 embedding 矩阵(输入或 LM head)
+    total = nonemb + 2 * vocab_emb
     return {
         "d_model": d,
         "n_layers": layers,
         "n_heads": cfg.get("num_attention_heads"),
         "vocab": vocab,
         "n_nonemb": nonemb,
-        "n_embed": 2 * vocab * d,
+        "n_embed": 2 * vocab_emb,
+        "n_vocab_emb": vocab_emb,  # 只用于解释 HF 那个中间量, 不参与口径计算
         "n_total": total,
     }
 
@@ -132,9 +135,16 @@ def plan_budget(
         "basis": basis,
         "n_total": params["n_total"],
         "n_nonemb": params["n_nonemb"],
-        # C = 6ND 里的 N 用总参数量(含 embedding), 与论文口径一致
+        # 两个算力口径都记下来, 供 §3 的口径敏感性分析用(见 PLAN §3 的 ⚠️):
+        #   flops        = 6·N_total·D   ← 论文口径(把 embedding 也算进 N)
+        #   flops_nonemb = 6·N_nonemb·D  ← 彻底排除 embedding 的口径
+        # 两者在小模型上差别巨大(14m: embedding 占 91.5%), 而大模型上几乎一致
+        # (1.2b: 15.9%) —— 所以"用哪个口径"会系统性地改变谷底位置, 必须两个都算。
+        # ⚠️ 千万别用 HF 的 total_flos, 它不是这两个中的任何一个, 见 warn_flos_trap。
         "flops": 6 * params["n_total"] * steps * tps,
+        "flops_nonemb": 6 * params["n_nonemb"] * steps * tps,
         "token_param_ratio": (steps * tps) / params["n_total"],
+        "token_param_ratio_nonemb": (steps * tps) / params["n_nonemb"],
     }
 
 
@@ -312,51 +322,118 @@ def cross_check_params(run_dir: Path, params: dict) -> None:
         )
 
 
-def warn_flos_trap(run_dir: Path, params: dict, budget: dict) -> None:
-    """⚠️ 提醒: HF 记的 `total_flos` **不能**当成 C=6ND 用。
+def log_flops_calibers(run_dir: Path, params: dict, budget: dict) -> None:
+    """把我们自己算的两个算力口径打出来, 并明确指出 HF 的 total_flos 不在其中。
 
-    实测(transformers 5.8.0, trainer.py:3900)HF 的口径是:
-        6 × num_parameters(exclude_embeddings=True) × tokens
-    而 `exclude_embeddings=True` 在 `tie_word_embeddings=False` 时**只排除了输入
-    embedding, LM head(输出 embedding)仍被算进去** —— 于是它既不是论文的
-    `N_total` 也不是真正的 non-embedding, 是个中间量。
+    ## 两个口径都由我们自己算, 不依赖任何库
 
-    危害在于**偏差随尺寸变化**: 我们的 vocab=50304 偏大, embedding 占比从
-    14m 的 91.5% 降到 1.2b 的 15.9%, 所以
+        C_total = 6·N_total·D    ← 论文口径。论文明确 "include all training FLOPs,
+                                   including those contributed to by the embedding
+                                   matrices", 所以 embedding 算进 N
+        C_nonemb = 6·N_nonemb·D  ← 彻底排除 embedding 的口径(输入 embedding 和
+                                   LM head 都不算)
 
-        HF口径 / 论文口径 = 1 - vocab·d / N_total
+    ## ⚠️ 为什么不能用 `num_parameters(exclude_embeddings=True)`
 
-    从 14m 的 0.542 一路升到 1.2b 的 0.920 —— 差 1.7 倍。若拿它当横轴 C,
-    小模型会被系统性地压向一侧, 直接扭曲拟合出的指数 a。
+    HF 的 `total_flos` 用的是 `6 × num_parameters(exclude_embeddings=True) × tokens`
+    (transformers 5.8.0, `trainer.py:3900`)。但实测在 `tie_word_embeddings=False`
+    时, `exclude_embeddings=True` **只排除了输入 embedding, LM head 仍被算进去**:
 
-    所以横轴一律用 budget.json 里的 `flops`(= 6·N_total·D, 论文口径)。
-    这里只在两者差异明显时打印一行提示, 不改任何东西。
+        num_parameters()                          = 14,067,712   ← N_total, 与公式一致
+        num_parameters(exclude_embeddings=True)   =  7,628,800   ← 排了 1 个 embedding
+        真正的 N_nonemb                            =  1,189,888   ← 排了 2 个
+
+    所以它是个**中间量**(= N_total − vocab·d), 既不是 C_total 也不是 C_nonemb。
+    危害在于偏差随尺寸变化 —— 实测比值 HF/C_total 从 14m 的 0.542 升到 1.2b 的
+    0.920(因为 vocab=50304 偏大, embedding 占比从 91.5% 降到 15.9%), 差 1.7 倍。
+    拿它当横轴会把小模型系统性压向一侧, 直接扭曲指数 a, 且因为是尺寸相关的偏差、
+    不是常数偏移, 事后很难发现。
+
+    本函数因此**自己拆参数量算**, 完全绕开 HF 那个数; 只在日志里对照打印,
+    便于发现上游行为变化。
     """
+    c_total = budget["flops"]
+    c_nonemb = budget["flops_nonemb"]
+    LOG.info("算力口径(均自算, 不依赖库):")
+    LOG.info("  C_total  = 6·N_total·D  = 6 × %s × %s = %.4e", f"{params['n_total']:,}", f"{budget['tokens_actual']:,}", c_total)
+    LOG.info("  C_nonemb = 6·N_nonemb·D = 6 × %s × %s = %.4e", f"{params['n_nonemb']:,}", f"{budget['tokens_actual']:,}", c_nonemb)
+    LOG.info("  两者之比 = %.4f  (embedding 占 N_total 的 %.1f%%)", c_nonemb / c_total, 100 * params["n_embed"] / params["n_total"])
+    LOG.info(
+        "  → 拟合时建议两个口径各跑一遍(见 PLAN §3 的敏感性分析): 小模型端 %.1f%% 的参数是词表,"
+        " 论文『embedding 贡献很小』的前提在 d=%d 时不成立",
+        100 * params["n_embed"] / params["n_total"], params["d_model"],
+    )
+
     res = None
     for cand in [run_dir / "train_results.json", *sorted(run_dir.glob("*/train_results.json"))]:
         if cand.exists():
             res = json.loads(cand.read_text())
             break
-    if not res or not res.get("total_flos"):
+    if res and res.get("total_flos"):
+        hf = float(res["total_flos"])
+        LOG.info(
+            "  对照: HF total_flos = %.4e  →  HF/C_total = %.3f (即 N_total − vocab·d = %s, 中间量, 不用)",
+            hf, hf / c_total, f"{params['n_total'] - params['n_vocab_emb']:,}",
+        )
+
+
+# 训练完成后删掉的"体积大但拟合缩放律用不到"的东西。
+# 保留: trainer_log.jsonl(loss 的唯一必需来源)、trainer_state.json(含 grad_norm)、
+#       loss.png/summary.json(我们生成的)、train.yaml/budget.json(口径)。
+# 删除: 权重、分词器副本、被重写过的 config —— 拟合只用 loss-vs-C, 复跑用 train.yaml。
+PRUNE_PATTERNS = (
+    "model.safetensors",
+    "*.safetensors",
+    "*.bin",  # pytorch_model.bin / training_args.bin
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "chat_template.jinja",
+    "generation_config.json",
+    "config.json",
+    "README.md",
+    "all_results.json",  # train_results.json 的孪生副本(md5 相同)
+)
+
+
+def prune_run_artifacts(run_dir: Path, keep: bool) -> None:
+    """清掉本 run 里与缩放律无关的大件(权重等), 只留 loss / 口径 / 配置。
+
+    为什么必须删: `pt/workflow.py:64` 的 `trainer.save_model()` 是无条件执行的,
+    没有开关能跳过(LlaMA-Factory 未 override, HF 原生 save_model 总是写盘)。
+    而 `/volume/data` 配额只剩几百 M —— 14m 的权重就 54M, 1.2b 要 4.8G,
+    不删的话网格跑到一半必然撑爆。
+
+    `--keep-model` 可以关掉这个清理(比如想拿模型去做别的验证或推理)。
+    """
+    out_dir = run_dir / "out"
+    if not out_dir.exists():
+        return
+    if keep:
+        LOG.info("--keep-model: 保留权重等全部产物")
         return
 
-    hf_flos = float(res["total_flos"])
-    ours = budget["flops"]
-    predicted_ratio = 1 - params["n_embed"] / 2 / params["n_total"]  # 1 - 一个embedding/N
-    LOG.info(
-        "⚠️  HF 的 total_flos = %.3e, 论文口径 6ND = %.3e (比值 %.3f) —— 这是已知口径差异, 不是 bug",
-        hf_flos, ours, hf_flos / ours,
-    )
-    LOG.info(
-        "    原因: HF 用 6×num_parameters(exclude_embeddings=True)×tokens, 而我们 vocab=%d 且"
-        " tie=False, 它只排除了输入 embedding、漏掉 LM head。",
-        params["vocab"],
-    )
-    LOG.info(
-        "    → 横轴 C 请用 budget.json 的 flops(=6·N_total·D)。该口径差异随尺寸从 0.542(14m)"
-        " 变到 0.920(1.2b), 若误用会扭曲指数 a。本次预测比值 %.3f",
-        predicted_ratio,
-    )
+    freed = 0
+    removed: list[str] = []
+    for pattern in PRUNE_PATTERNS:
+        for f in out_dir.rglob(pattern):
+            if f.is_file() and not f.is_symlink():
+                size = f.stat().st_size
+                freed += size
+                removed.append(f"{f.relative_to(run_dir)} ({size / 1e6:.1f}M)")
+                f.unlink()
+
+    # 中间检查点目录(HF 的 checkpoint-N/, 含逐卡 rng_state)
+    for ckpt in sorted(out_dir.glob("checkpoint-*")):
+        if ckpt.is_dir():
+            size = sum(p.stat().st_size for p in ckpt.rglob("*") if p.is_file())
+            freed += size
+            removed.append(f"{ckpt.relative_to(run_dir)}/ 目录 ({size / 1e6:.1f}M)")
+            shutil.rmtree(ckpt)
+
+    LOG.info("清理: 删掉 %d 项, 释放 %.1fM(只保留 loss / 配置 / 口径)", len(removed), freed / 1e6)
+    for r in removed:
+        LOG.info("  - %s", r)
 
 
 def bj_now() -> str:
@@ -391,6 +468,7 @@ def main() -> int:
     ap.add_argument("--warmup-steps", type=int, default=None, help="默认 max(20, 2%% of steps)")
     ap.add_argument("--grad-checkpointing", action="store_true", help="大模型放不下时开")
     ap.add_argument("--save-final", action="store_true", help="存最后一个检查点(默认不存, 拟合只需 loss)")
+    ap.add_argument("--keep-model", action="store_true", help="训练后保留权重(默认删掉, 只留 loss/口径/配置)")
     ap.add_argument("--save-steps", type=int, default=None)
     ap.add_argument("--num-workers", type=int, default=8)
     ap.add_argument("--corpus", default=CORPUS_DIR)
@@ -493,9 +571,10 @@ def main() -> int:
         return code
 
     cross_check_params(run_dir, params)
-    warn_flos_trap(run_dir, params, budget)
+    log_flops_calibers(run_dir, params, budget)
 
-    # ---- 5. 出图 ---------------------------------------------------------- #
+    # ---- 5. 出图(必须在清理之前: 图/摘要依赖 trainer_log.jsonl, 清理不删它,
+    #          但顺序上先出图更稳 —— 万一以后清理规则改宽了也不会误伤)----- #
     LOG.info("-" * 78)
     try:
         # 传 run_dir 而不是 out_dir: trainer_log.jsonl 在 out/ 下, 但
@@ -508,6 +587,11 @@ def main() -> int:
         LOG.info("曲线: %s", run_dir / "loss.png")
     except Exception as e:  # 图挂了不该让整个 run 算失败 —— 日志里还有原始数据
         LOG.error("出图失败(%s: %s), 但训练记录在 %s", type(e).__name__, e, out_dir / "trainer_log.jsonl")
+
+    # ---- 6. 清理 ---------------------------------------------------------- #
+    LOG.info("-" * 78)
+    prune_run_artifacts(run_dir, keep=a.keep_model)
+    LOG.info("run 目录现在的大小: %s", subprocess.run(["du", "-sh", str(run_dir)], capture_output=True, text=True).stdout.split()[0])
 
     LOG.info("=" * 78)
     LOG.info("完成: %s  总用时 %.1f min", run_dir, (time.time() - t0) / 60)

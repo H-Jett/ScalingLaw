@@ -37,7 +37,19 @@ COLORS = ["#2E5EAA", "#D1495B", "#2A9D8F", "#E9C46A", "#8E7DBE", "#F4A261", "#6A
 
 
 def find_log(run_dir: Path) -> Path | None:
-    """在 run 目录里找 trainer_log.jsonl(LlaMA-Factory 写在 output_dir 下)。"""
+    """在 run 目录里找 loss 记录。
+
+    ⚠️ **优先读 `trainer_log.jsonl`, 而不是 `trainer_state.json`** —— 实测两者
+    的 step/loss 完全相同(504/504 点逐值相等), 但:
+
+      - `trainer_log.jsonl` 每行一条直线记录(键: current_steps/loss/lr/epoch/
+        elapsed_time/percentage), 结构扁平、容错好(半行 JSON 直接跳过)
+      - `trainer_state.json` 是整个训练状态的大对象, 要先全量解析再下钻
+        `log_history`; 键名也不一样(step/learning_rate/grad_norm)
+
+    所以 jsonl 是**唯一必需**的 loss 来源, state 只在需要 `grad_norm` 时才读。
+    清理权重时两者都会保留。
+    """
     for cand in [run_dir / "trainer_log.jsonl", *sorted(run_dir.glob("*/trainer_log.jsonl"))]:
         if cand.exists():
             return cand
@@ -115,26 +127,50 @@ def load_tokens_per_step(run_dir: Path) -> float | None:
     return None
 
 
-def summarize(curve: dict, out_dir: Path) -> dict:
-    """写 summary.json —— 阶段 4 拟合缩放律时直接从这一堆 json 里汇总。"""
+def read_budget(run_dir: Path) -> dict:
+    """读 run 目录里的 budget.json(参数量与算力口径, 由 train_abl.py 写)。"""
+    for cand in [run_dir / "budget.json", *sorted(run_dir.glob("*/budget.json"))]:
+        if cand.exists():
+            return json.loads(cand.read_text())
+    LOG.warning("%s: 找不到 budget.json, 算力口径会缺失", run_dir)
+    return {}
+
+
+def summarize(curve: dict, run_dir: Path) -> dict:
+    """写 summary.json —— 阶段 4 拟合缩放律时直接从这一堆 json 里汇总。
+
+    这里**只放可信口径**: `flops` / `flops_nonemb` 都取自 budget.json(由公式算出),
+    绝不从 HF 的 `train_results.json.total_flos` 取 —— 后者是
+    `6 × num_parameters(exclude_embeddings=True) × D`, 在 tie=False 时只排除了
+    一个 embedding, 是个既非 N_total 也非 N_nonemb 的中间量, 且偏差随尺寸变化
+    (14m 0.542 → 1.2b 0.920), 拿来做横轴会扭曲指数 a。详见 PLAN §9.4。
+    """
     lrs = [x for x in curve["lrs"] if x is not None]
+    b = read_budget(run_dir)
     summary = {
         "name": curve["name"],
         "run_dir": curve["run_dir"],
+        # ---- 纵轴: loss ----
         "first_loss": curve["first_loss"],
         "last_loss": curve["last_loss"],
         "min_loss": curve["min_loss"],
         "final_lr": lrs[-1] if lrs else None,
         "max_lr": max(lrs) if lrs else None,
         "n_points": curve["n_points"],
+        # ---- 横轴: N / D / C (全部来自 budget.json, 自算口径) ----
         "steps": curve["steps"][-1] if curve["steps"] else None,
         "tokens_per_step": curve["tokens_per_step"],
         "total_tokens": (curve["steps"][-1] * curve["tokens_per_step"]) if curve["tokens_per_step"] else None,
+        "N_total": b.get("n_total"),
+        "N_nonemb": b.get("n_nonemb"),
+        "flops": b.get("flops"),  # C = 6·N_total·D      ← 主口径
+        "flops_nonemb": b.get("flops_nonemb"),  # C = 6·N_nonemb·D   ← 敏感性分析口径
+        "token_param_ratio": b.get("token_param_ratio"),
     }
     # 末尾 loss 的均值比单点更稳(最后几个点还会抖), 拟合时常用这个
     tail = curve["losses"][-max(1, len(curve["losses"]) // 20) :]
     summary["tail_mean_loss"] = sum(tail) / len(tail)
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     return summary
 
 
@@ -223,7 +259,12 @@ def main() -> None:
     if not a.no_summary:
         for d, c in zip(dirs, curves):
             s = summarize(c, d)
-            LOG.info("%s: 末 loss %.4f (尾部均值 %.4f)", s["name"], s["last_loss"], s["tail_mean_loss"])
+            LOG.info(
+                "%s: 末 loss %.4f (尾部均值 %.4f) | N_total=%s C=%.3e",
+                s["name"], s["last_loss"], s["tail_mean_loss"],
+                f"{s['N_total']:,}" if s["N_total"] else "-",
+                s["flops"] or 0,
+            )
 
 
 if __name__ == "__main__":
