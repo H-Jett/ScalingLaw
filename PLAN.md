@@ -395,10 +395,16 @@ transformers** —— 那会把 torch/accelerate 一起拖下水。需要时用 
 | `out/train_results.json` | 收尾汇总：`train_loss`/`train_runtime`/`samples_per_second`/`total_flos` | `total_flos` 有个口径坑，见 §9.4 |
 | `out/all_results.json` | 同上的副本（HF 给"所有阶段结果"留的位置） | — |
 | `out/runs/*/events.out.tfevents.*` | TensorBoard 事件（`report_to: tensorboard`） | 本地 loss 的第二份记录 |
-| `out/model.safetensors` | **最终模型权重** | ⚠️ 磁盘大户（14m 就 54M）；拟合只需 loss，默认**不存**中间检查点 |
-| `out/config.json` `generation_config.json` `tokenizer.json` `tokenizer_config.json` `chat_template.jinja` | 模型卡与分词器副本 | 框架自动拷到 output_dir |
-| `out/README.md` | 自动生成的模型卡 | 没手写内容，当噪声看即可 |
-| `out/checkpoint-*/` | 检查点（`--save-final` 时才出现） | 含 `rng_state_*.pth`，逐卡一份 |
+| `out/model.safetensors` | **最终模型权重** | ⚠️ **磁盘大户，且无条件写入**（`pt/workflow.py:64` 的 `trainer.save_model()`）—— 14m 就 54M，1.2b 约 4.8G。`--save-final` 管不了它，只控制中间检查点。拟合只需 loss，这是盘上唯一值得关注的大件 |
+| `out/config.json` `generation_config.json` `tokenizer.json` `tokenizer_config.json` `chat_template.jinja` | **被框架改写过的**模型配置与分词器（不是源文件的拷贝） | 实测 `config.json` 被 transformers 5.8.0 按新 schema 重写（`rope_scaling`→`rope_parameters` 等）；`tokenizer.json` 加了 `pad_token`。**实测分词结果与源逐 token 一致**，无影响 |
+| `out/README.md` | 自动生成的模型卡 | `base_model` 只是指向 `models/configs/pythia-14m` 的**指针**，不是副本 |
+| `out/checkpoint-*/` | 中间检查点（`--save-final` 时才出现） | 含 `rng_state_*.pth`，逐卡一份；默认**不存** |
+
+**重合度实测**（`runs/test-14m-e2e`）：run 根与 `out/` **文件名零重合**；内容上只有两处重叠 ——
+`train_results.json` ≡ `all_results.json`（md5 相同，各 219 字节），以及
+`trainer_log.jsonl` 与 `trainer_state.json` 的 `log_history`（504 个点的 step/loss 完全相同，
+但键互补：jsonl 多 `elapsed_time`/`percentage`，state 多 `grad_norm`）。
+**没有值得清理的重复** —— run 根 348K 中 99% 是 `loss.png`+`train.log`，`out/` 58M 中 97% 是权重。
 
 ### 9.3 swanlab
 
