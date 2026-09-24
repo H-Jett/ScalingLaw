@@ -1,6 +1,7 @@
 # ---- 生成物(体积大或可复现, 不入库) ----
-models/                 # gen_model.py 生成的各尺寸模型目录(config+tokenizer, 无权重)
-logs/                   # 训练日志
+models/                 # make_model_ladder.py 生成的各尺寸 config(config+tokenizer, 无权重)
+logs/                   # 训练日志(scripts/train_abl.py)
+runs/                   # 每个 run 的配置/预算/checkpoint/曲线(scripts/train_abl.py 的产出)
 outputs/
 saves/
 data/*
