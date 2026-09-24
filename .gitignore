@@ -6,8 +6,10 @@
 # 注意 config.json / README.md 已被跟踪, 忽略规则对已跟踪文件无效, 它们仍会入库
 models/
 
-# scripts/train_abl.py 的训练日志
+# scripts/train_abl.py 的训练日志(曾有 8 个 .log 已入库, 已在 .gitignore 那次
+# commit 里 git rm --cached 摘掉; 忽略规则对已跟踪文件无效, 所以必须显式移除)
 logs/
+*.log
 
 # scripts/train_abl.py 每个 run 的配置/预算/checkpoint/曲线(loss.png 等)
 runs/
