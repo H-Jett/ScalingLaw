@@ -1,11 +1,23 @@
 # ---- 生成物(体积大或可复现, 不入库) ----
-models/                 # make_model_ladder.py 生成的各尺寸 config(config+tokenizer, 无权重)
-logs/                   # 训练日志(scripts/train_abl.py)
-runs/                   # 每个 run 的配置/预算/checkpoint/曲线(scripts/train_abl.py 的产出)
+# 注意: .gitignore 不支持行尾注释 —— `runs/   # 说明` 会被当成一整个模式,
+# 永远匹配不上。注释必须独占一行。(这个坑之前让 logs/ 和 models/ 的忽略规则失效)
+
+# make_model_ladder.py 生成的各尺寸 config(config+tokenizer, 无权重)
+# 注意 config.json / README.md 已被跟踪, 忽略规则对已跟踪文件无效, 它们仍会入库
+models/
+
+# scripts/train_abl.py 的训练日志
+logs/
+
+# scripts/train_abl.py 每个 run 的配置/预算/checkpoint/曲线(loss.png 等)
+runs/
+
 outputs/
 saves/
+
+# 语料本体不入库, 配置入库
 data/*
-!data/dataset_info.json # 语料配置要入库, 语料本体不入库
+!data/dataset_info.json
 
 # ---- Python ----
 __pycache__/
