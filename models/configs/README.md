@@ -101,8 +101,8 @@ minimize  |log(N/N_target)| + λ·|log(L/L_ideal)|        λ = --aspect-penalty
 `vocab=50304` 时, embedding 是 `2·50304·d = 100608·d` 个参数, **与 `L` 无关**。
 `d=256` 时它就是 25.8M —— 比整个「10M 模型」还大。所以:
 
-- `--size-by non-embedding`(默认): 按非 embedding 定尺寸。这才是真正做计算的部分,
-  也是缩放律里 `N` 的物理含义
+- `--size-by non-embedding`(默认): 按非 embedding 定尺寸, 也就是只按"真正做计算的那部分"
+  对齐各档大小。这样各档的计算层是等比的, embedding 带来的差异不会掩盖尺寸跨度
 - `--size-by total`: 按总参数量(也就是 pythia/HF 命名的口径)。小端会退化成
   「小 transformer + 大查找表」
 

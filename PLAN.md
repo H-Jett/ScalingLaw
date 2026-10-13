@@ -197,21 +197,30 @@ token"），让几何上确实存在一个内部极小值，而不去猜它在�
 `train_abl.py` 能随时补单个 run，不必重跑已有的。补点必须基于"几何上还不够宽"这个理由，
 不能基于"我猜谷应该在那边"。
 
-### 3.3 ⚠️ 算力口径必须两个都记
+### 3.3 ⚠️ 算力口径：主口径是 `C_total`，另一个只作对照
 
 `budget.json` / `summary.json` 里同时存了两个口径（`train_abl.py` 自动算）：
 
 ```
-C_total  = 6·N_total·D      ← N 含 embedding（论文的 C = 6ND 用这个）
-C_nonemb = 6·N_nonemb·D     ← 彻底排除 embedding
+C_total  = 6·N_total·D      ← 主口径。N 含 embedding —— 论文 Appendix F 原文:
+                               "we also count embeddings matrices in the total
+                                parameter count", 所以 C = 6ND 里就是这个 N
+C_nonemb = 6·N_nonemb·D     ← 对照口径（排除 embedding），本文用它做敏感性检查
 ```
 
-**两者在 14m 上差 11.8 倍**（embedding 占 91.5%），在 1.2b 上只差 1.2 倍。所以"用哪个
-口径"会**系统地改变谷底位置**，尤其在小模型端——这是本实验一个真实的不确定性来源，
-必须两个都拟合、把差异报告出来，而不是选一个更"好看"的。
+**拟合与结论一律用 `C_total`。** `C_nonemb` 只是用来验证一件事：结论对口径的选择
+有多敏感。
 
-（论文把 embedding 算进 N，但它的 vocab 只有 32k 且模型都很大，所以这个选择在它那里
-几乎无影响；我们 vocab=50304 且要跑到 14m 这种尺寸，论文的前提在**小端不成立**。）
+这个检查在本实验里**是必要的**，因为论文能忽略 embedding 的前提我们不满足——它训的
+模型都很大且 vocab 只有 32k，而我们是 `vocab=50304` 且要跑到 14m 这种尺寸：
+
+| 尺寸 | embedding 占 `N_total` | `C_total` / `C_nonemb` |
+|---|---|---|
+| `pythia-14m` | 91.5% | 11.8× |
+| `pythia-1.2b` | 15.9% | 1.2× |
+
+所以"用哪个口径"会**系统地改变谷底位置**，尤其在小模型端——这是本实验一个真实的不
+确定性来源，必须两个都拟合、把差异报告出来，而不是选一个更"好看"的。
 
 ⚠️ **绝对不要用 HF 的 `total_flos`** —— 它是 `6 × num_parameters(exclude_embeddings=True) × D`，
 在 `tie_word_embeddings=False` 时只排除了一个 embedding，既非 `N_total` 也非 `N_nonemb`，
@@ -322,7 +331,7 @@ C_nonemb = 6·N_nonemb·D     ← 彻底排除 embedding
 
 ### 阶段 4：拟合与对照（~2 天）
 - 每条 isoFLOP 曲线拟合抛物线 → 顶点即 `N_opt(C)`、`D_opt(C)`
-  - **两个算力口径各拟合一遍**（`C_total` 与 `C_nonemb`，见 §3.3），报告差异
+  - 主口径用 `C_total`（论文口径）；再用 `C_nonemb` 跑一遍作对照，报告两者差异（§3.3）
 - 对 `(C, N_opt)` 和 `(C, D_opt)` 拟合幂律 → 得到 `(a, b)`，**给出置信区间**
 - 用全部终点 loss 拟合 `L(N,D) = E + A/N^α + B/D^β`
 - **到这里才可以翻论文**：对照它的指数、Epoch AI 复现的修正指数
@@ -345,7 +354,7 @@ C_nonemb = 6·N_nonemb·D     ← 彻底排除 embedding
 | 每条 isoFLOP 曲线有内部极小 | 必须 | 单调 = 跨度不够，按 §3.2 补点。**但不许为了凑出谷而反复挪网格** |
 | 各尺寸调参同等充分 | 必须 | 阶段 2 的记录可查：每个尺寸都是各自扫出来的最优 |
 | 原始 loss 留存 | 必须 | `runs/*/summary.json` + `trainer_log.jsonl` 全留，别人可复算 |
-| 报告不确定性 | 必须 | 指数给置信区间；两个算力口径的差异一并报 |
+| 报告不确定性 | 必须 | 指数给置信区间；`C_total` 与 `C_nonemb` 两个口径的差异一并报 |
 
 ### 6.2 结论（**开放，不预设**）
 
@@ -572,17 +581,16 @@ embedding，LM head 仍被算进去**。实测：
 
 ```
 flops        = 6·N_total·D     ← 主口径（论文把 embedding 算进 N）
-flops_nonemb = 6·N_nonemb·D    ← 敏感性分析口径（彻底排除 embedding）
+flops_nonemb = 6·N_nonemb·D    ← 对照口径（排除 embedding），只做敏感性检查
 ```
 
 `log_flops_calibers()` 每次 run 打印两者比值，并**对照** HF 的 `total_flos` 提醒它
 落在哪儿（实测比值与预测 `1 − vocab·d/N_total` 完全吻合）。`plot_run.summarize()` 也只从
 `budget.json` 取口径，绝不读 `train_results.json` 的 `total_flos`。
 
-**所以横轴一律用 `budget.json` 里的 `flops`（= `6·N_total·D`，论文口径）。**
-`train_abl.warn_flos_trap` 每次 run 都会把两者的比值打出来提醒（实测比值与预测
-`1 - vocab·d/N_total` 完全吻合）。注意这与论文"把 embedding 算进总参数"的表述一致
-（§3），口径不要混。
+**所以横轴一律用 `budget.json` 里的 `flops`（= `6·N_total·D`，论文口径，见 §3.3）。**
+`train_abl.log_flops_calibers()` 每次 run 都会把两个口径的比值打出来（实测比值与预测
+`1 − vocab·d/N_total` 完全吻合），并与 HF 的 `total_flos` 对照，便于发现上游行为变化。
 
 ## 10. 关键参考
 

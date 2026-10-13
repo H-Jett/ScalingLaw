@@ -51,8 +51,8 @@ LLaMA-Factory 的 `train_from_scratch: true` 从零初始化。
     d=256 时这张查找表就是 25.8M —— 比整个"10M 模型"还大。所以:
       --size-by total          : 总参数量(HF/pythia 命名口径)。小端会被 embedding
                                  淹没, 退化成"小 transformer + 大查找表"
-      --size-by non-embedding  : 非 embedding 参数量(默认)。这才是"真正做计算的"
-                                 那部分, 也是缩放律里 N 的物理含义
+      --size-by non-embedding  : 非 embedding 参数量(默认)。只按"真正做计算的那部分"
+                                 对齐各档大小, 尺寸跨度不被 embedding 稀释
     目录名用**总参数量**(与 pythia 官方命名一致), 阶梯按 non-embedding 定 ——
     所以会看到"名义 14m、计算层只有 1.2M", 这不矛盾, 是两个口径。占比 >50% 会告警。
 """
