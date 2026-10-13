@@ -1,9 +1,10 @@
 # 模型尺寸阶梯
 
-> 本文件由 `scripts/make_model_ladder.py` 自动生成, **请勿手改** —— 改脚本重跑即可。
+> 本文件原是脚本自动生成的尺寸记录, 现在**手工维护**(尺寸设计规则那一节仍是对这份阶梯的完整说明)。
+> 尺寸若要改动, 改 `scripts/generate_model_configs.py` 的参数重跑, 然后回来更新本文件的表。
 
-- 生成时间: 2026-09-23 19:02:59
-- 模板: `EleutherAI/pythia-14m`(下载源 `cache`)
+- 生成时间: 2026-09-23 19:02:59(表内容经 `generate_model_configs.py` 重放核对, 逐值一致)
+- 模板: `models/templates/pythia-14m`
 - 档数: 7(第 1 档为模板本身, 原样保留不搜索)
 - 阶梯口径: **non-embedding** 参数量(非 embedding = 真正参与计算的那部分)
 - 长宽比律: `L = 6·(d/128)^0.5`,锚点 = 模板本身
@@ -122,9 +123,10 @@ minimize  |log(N/N_target)| + λ·|log(L/L_ideal)|        λ = --aspect-penalty
 ## 复现
 
 ```bash
-python scripts/make_model_ladder.py --count 7 --max 1e+09 --size-by non-embedding --d-granularity 64 --depth-exponent 0.5 --aspect-penalty 0.5
+python scripts/generate_model_configs.py --template-dir models/templates/pythia-14m --count 7 --max 1e+09 --size-by non-embedding
 ```
 
 生成的每个目录只有 `config.json` + tokenizer(**无权重**), 供 LLaMA-Factory 的
-`train_from_scratch: true` 从零初始化。tokenizer 默认是软链接指向模板 —— 
-**新 clone 后软链接会悬空, 必须先跑一次本脚本把模板下下来**(或用 `--copy-tokenizer`)。
+`train_from_scratch: true` 从零初始化。tokenizer 默认是软链接指向模板目录, 所以
+`config.json` 和 tokenizer 都随仓库一起入库(clone 下来即可用, 不需要额外的下载步骤)。
+模板本身也是入库的; 要换模板就用 `--template-dir` 指过去。

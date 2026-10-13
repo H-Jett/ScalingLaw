@@ -145,8 +145,9 @@ batch / seq / 宽度。
 
 ## 2. 模型尺寸阶梯
 
-由 `scripts/make_model_ladder.py` 从 pythia-14m 模板派生，**第 1 档就是模板本身**（原样保留，
-它是长宽比律的锚点，也是唯一能对官方曲线做交叉验证的尺寸）。
+由 `scripts/generate_model_configs.py` 从 pythia-14m 模板派生，**第 1 档就是模板本身**（原样保留，
+它是长宽比律的锚点，也是唯一能对官方曲线做交叉验证的尺寸）。`vocab_size`、长宽比锚点
+`(d0, L0)` 都从模板 config 里读，所以换模板就能换一整套阶梯。
 
 | 目录 | d_model | L | heads | head_dim | ffw | N_非emb | N_总 | emb占比 |
 |---|---|---|---|---|---|---|---|---|
@@ -366,7 +367,7 @@ C_nonemb = 6·N_nonemb·D     ← 彻底排除 embedding
 ScalingLaw/
   PLAN.md                       # 本文件
   scripts/
-    make_model_ladder.py        # 从 pythia-14m 模板派生尺寸阶梯(config+tokenizer, 无权重)
+    generate_model_configs.py   # 从模板目录派生尺寸阶梯(config+tokenizer, 无权重)
     corpus.py                   # 语料盘点 / 切片规划 / 落地成 LLaMA-Factory 数据集
     train_abl.py                # 一个 run 的编排: 预算 -> 备数据 -> 生成配置 -> 训练 -> 出图
     plot_run.py                 # 读本地 loss 记录画曲线(单 run / 多 run 叠加)
@@ -382,9 +383,11 @@ ScalingLaw/
   submodules/LLaMA-Factory/     # 训练框架(submodule, 需 init, 见 §8.1)
 ```
 
-⚠️ **软链接注意**：`models/configs/*/tokenizer.json` 是指向 `models/templates/` 的软链接。
-新 clone 后软链接会悬空，**必须先跑一次 `make_model_ladder.py` 把模板下下来**。
-另外 `workspace/LLaMA-Factory -> submodules/LLaMA-Factory` 这条链接（§8.1）也需要重建。
+⚠️ **软链接注意**：`models/configs/*/tokenizer.json` 是指向 `models/templates/` 的软链接，
+模板本身（config + tokenizer）已随仓库入库，所以 **clone 下来就能直接用**，不需要额外的下载步骤
+（模板下载是一次性操作，刻意没有放进 `generate_model_configs.py`；真要重新下就手动
+`HF_TOKEN=... hf download EleutherAI/pythia-14m --local-dir models/templates/pythia-14m`）。
+另外 `workspace/LLaMA-Factory -> submodules/LLaMA-Factory` 这条链接（§8.1）需要重建。
 每个 run 的 `runs/<名>/data/raw/*.parquet` 也是软链接，指向 open_source 里的语料。
 
 ## 8. 环境与运行
