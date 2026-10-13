@@ -6,7 +6,8 @@
 - 生成时间: 2026-09-23 19:02:59(表内容经 `generate_model_configs.py` 重放核对, 逐值一致)
 - 模板: `models/templates/pythia-14m`
 - 档数: 7(第 1 档为模板本身, 原样保留不搜索)
-- 阶梯口径: **non-embedding** 参数量(非 embedding = 真正参与计算的那部分)
+- 阶梯口径: **non-embedding** 参数量(非 embedding = 真正参与计算的那部分, 也是 Chinchilla 的 `N`)
+- ⚠️ 目录名口径: **总参数量**(与 pythia 官方命名一致), 所以 `pythia-14m` 的计算层只有 1.2M
 - 长宽比律: `L = 6·(d/128)^0.5`,锚点 = 模板本身
 - 离散约束: `d` 为 64 的倍数, `head_dim = clamp(≥d/16 的最小 2 的幂, 32, 128)`, `ffw = 4·d`, `L` 为整数
 - 词表: `vocab = 50304`(= 2 份 embedding 不共享, 合计 `2·50304·d`)
@@ -107,6 +108,26 @@ minimize  |log(N/N_target)| + λ·|log(L/L_ideal)|        λ = --aspect-penalty
 
 **目录名用的是总参数量口径**(和 pythia 官方命名一致), 所以会看到
 「名义 14m、非 emb 只有 1.2M」—— 这不矛盾, 是两个口径。
+
+**⚠️ 两个口径都被广泛使用, 报告结论时必须说清是哪个。**
+
+- **Chinchilla(论文口径)**: `N` **含** embedding。Appendix F 原文:
+  "We include all training FLOPs, including those contributed to by the embedding
+  matrices... we also count embeddings matrices in the total parameter count."
+  理由是它训的模型都很大, embedding 占比小到可忽略。`train_abl.py --ratio` 跟这个口径
+  (`ratio × N_total`)。
+- **Kaplan et al. 2020 口径**: `N` **不含** embedding。二者常被二手资料混为一谈。
+
+问题在于我们**不满足论文的前提** —— `vocab=50304` 偏大, 小端 embedding 占比极高:
+
+```
+pythia-14m :  emb 占 N_总 91.5%   →  ratio=20 时两种算法差 11.8 倍
+                                   (20×14.07M = 281M  vs  20×1.19M = 23.8M tokens)
+pythia-1.2b:  emb 占 N_总 15.9%   →  两者才收敛到接近
+```
+
+所以小端用 `ratio × N_total` 时, 预算主要花在喂词表而不是计算层。`--ratio` 在
+embedding 占比 >50% 时会打告警提示这一点。定网格时两个口径都要记(§3.3)。
 
 ### 5. 超参必须随尺寸变(否则训不起来)
 

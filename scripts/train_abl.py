@@ -115,9 +115,23 @@ def plan_budget(
     if tokens is None:
         if ratio is None:
             raise ValueError("必须给 --tokens 或 --ratio 之一")
-        # Chinchilla 的 20 tok/param 口径是按**总**参数量(含 embedding)算的
+        # Chinchilla 的 N 是**含 embedding** 的总参数量 —— Appendix F 原文:
+        #   "We include all training FLOPs, including those contributed to by the
+        #    embedding matrices... we also count embeddings matrices in the total
+        #    parameter count."
+        # 所以 "20 tok/param" 的 20 乘在 N_total 上。(注意: 按**非** embedding 参数量
+        # 算是 Kaplan et al. 2020 的口径, 两者常被搞混。)
+        # ⚠️ 但我们的 vocab=50304 偏大, 小端 embedding 占比极高(pythia-14m 占 91.5%),
+        # 此时 ratio×N_total 会给出与"计算层"严重脱节的 D —— 见下面的告警。
         tokens = ratio * params["n_total"]
         basis = f"ratio={ratio} × N_total"
+        emb_share = params["n_embed"] / params["n_total"]
+        if emb_share > 0.5:
+            LOG.warning(
+                "embedding 占 N_total 的 %.1f%%: ratio=%g × N_total 给出的 D 主要是在"
+                "喂词表, 计算层的实际 tok/param 只有 %.1f。论文的 20 tok/param 建立在"
+                "embedding 占比很低的前提上, 在 d=%d 这一档不成立 —— 定网格时留意。",
+                100 * emb_share, ratio, tokens / params["n_nonemb"], params["d_model"])
     else:
         basis = f"显式指定 tokens={tokens:.3e}"
 
@@ -140,9 +154,11 @@ def plan_budget(
         #   flops_nonemb = 6·N_nonemb·D  ← 彻底排除 embedding 的口径
         # 两者在小模型上差别巨大(14m: embedding 占 91.5%), 而大模型上几乎一致
         # (1.2b: 15.9%) —— 所以"用哪个口径"会系统性地改变谷底位置, 必须两个都算。
-        # ⚠️ 千万别用 HF 的 total_flos, 它不是这两个中的任何一个, 见 warn_flos_trap。
+        # ⚠️ 千万别用 HF 的 total_flos, 它不是这两个中的任何一个, 见 log_flops_calibers。
         "flops": 6 * params["n_total"] * steps * tps,
         "flops_nonemb": 6 * params["n_nonemb"] * steps * tps,
+        # 两个 tok/param 都记 —— 小端两者差一个数量级(14m: 5.7 vs 67),
+        # 报告结论时必须说清用的是哪个, 否则不可比。
         "token_param_ratio": (steps * tps) / params["n_total"],
         "token_param_ratio_nonemb": (steps * tps) / params["n_nonemb"],
     }
@@ -459,7 +475,9 @@ def main() -> int:
     ap.add_argument("--name", required=True, help="run 名, 决定 runs/<name>/ 和 swanlab run 名")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--tokens", type=float, help="训练 token 数(显式)")
-    g.add_argument("--ratio", type=float, help="训练 token 数 = ratio × N_total (Chinchilla 用 20)")
+    g.add_argument("--ratio", type=float,
+                   help="训练 token 数 = ratio × N_total (Chinchilla 的 20 tok/param 就是这个口径, "
+                        "论文把 embedding 算进 N)。⚠️ 小端 embedding 占比高时会告警")
     ap.add_argument("--seq", type=int, default=2048, help="序列长度; 实测 2048 时 MFU 最高(见 PLAN §1.1)")
     ap.add_argument("--batch", type=int, default=8, help="每卡 micro batch")
     ap.add_argument("--grad-accum", type=int, default=1)
@@ -580,7 +598,11 @@ def main() -> int:
         # 传 run_dir 而不是 out_dir: trainer_log.jsonl 在 out/ 下, 但
         # budget.json(每步 token 数)在 run_dir 下, read_curve 两边都会找
         curve = plot_run.read_curve(run_dir)
-        plot_run.plot([curve], run_dir / "loss.png", title=f"{a.name}  (N={params['n_total']/1e6:.1f}M, D={budget['tokens_actual']/1e9:.2f}B)")
+        # 标题带上两种 N —— 小端两者差一个数量级, 光看一个数容易误读这个 run 的大小
+        plot_run.plot([curve], run_dir / "loss.png",
+                      title=f"{a.name}  (N_total={params['n_total']/1e6:.1f}M, "
+                            f"N_nonemb={params['n_nonemb']/1e6:.1f}M, "
+                            f"D={budget['tokens_actual']/1e9:.2f}B)")
         s = plot_run.summarize(curve, run_dir)
         LOG.info("loss: 首 %.4f -> 末 %.4f (尾部均值 %.4f, 最小 %.4f)",
                  s["first_loss"], s["last_loss"], s["tail_mean_loss"], s["min_loss"])
