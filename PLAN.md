@@ -181,7 +181,7 @@ isoFLOP 剖面法：每个预算 `C` 下扫一串尺寸，用最终 loss 拟合�
 - 选定 **3~4 个 isoFLOP 预算 `C`**（量级拉开，见下）
 - 每个 `C` 从 §2 的 7 档里挑 **4~5 档**尺寸
 - token 数由 `D = C/(6N)` 反推；`max_steps` 由 `D` 和每步 token 数算出，
-  **cosine 周期必须精确等于 `max_steps`**（`train_abl.py` 已固定这个行为）
+  **cosine 周期必须精确等于 `max_steps`**（`train.py` 已固定这个行为）
 
 ### 3.2 ⚠️ 尺寸跨度要靠**参数密度**保证，不能靠感觉
 
@@ -194,12 +194,12 @@ isoFLOP 剖面法：每个预算 `C` 下扫一串尺寸，用最终 loss 拟合�
 token"），让几何上确实存在一个内部极小值，而不去猜它在哪。
 
 **实操**：每个预算下先跑 4 档，拟合看有没有内部极小。**若单调（没有谷）就补点**——
-`train_abl.py` 能随时补单个 run，不必重跑已有的。补点必须基于"几何上还不够宽"这个理由，
+`train.py` 能随时补单个 run，不必重跑已有的。补点必须基于"几何上还不够宽"这个理由，
 不能基于"我猜谷应该在那边"。
 
 ### 3.3 ⚠️ 算力口径：主口径是 `C_total`，另一个只作对照
 
-`budget.json` / `summary.json` 里同时存了两个口径（`train_abl.py` 自动算）：
+`budget.json` / `summary.json` 里同时存了两个口径（`train.py` 自动算）：
 
 ```
 C_total  = 6·N_total·D      ← 主口径。N 含 embedding —— 论文 Appendix F 原文:
@@ -272,7 +272,7 @@ C_nonemb = 6·N_nonemb·D     ← 对照口径（排除 embedding），本文用
 多个 run 可以复用同一份语料。
 
 ⚠️ **磁盘**：`/volume/data` 配额**长期只剩 <1G**。语料已在盘上（不额外占），且
-`train_abl.py` 训练后会自动删掉权重等大件，**单个 run 现在只占 ~0.4M**（实测
+`train.py` 训练后会自动删掉权重等大件，**单个 run 现在只占 ~0.4M**（实测
 `test-prune-14m` 362K，清理掉了 59.9M = 99.7%）。跑网格前仍建议清掉旧 run，
 并注意 `1.2b` 档在**训练期间**仍需要足够空间写临时权重（约 4.8G）。
 
@@ -285,7 +285,7 @@ C_nonemb = 6·N_nonemb·D     ← 对照口径（排除 embedding），本文用
 - ⚠️ **仍待解决**：`/volume/data` 配额（见 §4 ⚠️）—— 不阻塞训练，阻塞**存权重**
 
 ### 阶段 1：小预算先验证闭环 ✅ **基本完成**
-- ✅ `scripts/train_abl.py` 一条命令跑通全流程（备数据→配置→训练→出图）
+- ✅ `scripts/train.sh` 顺序执行独立的数据准备、训练与出图脚本
 - ✅ 端到端实测两个尺寸，均 exit 0，**参数量与公式逐位相符**：
 
   | run | 参数量（实测 vs 公式） | loss | 用时 |
@@ -378,7 +378,8 @@ ScalingLaw/
   scripts/
     generate_model_configs.py   # 从模板目录派生尺寸阶梯(config+tokenizer, 无权重)
     corpus.py                   # 语料盘点 / 切片规划 / 落地成 LLaMA-Factory 数据集
-    train_abl.py                # 一个 run 的编排: 预算 -> 备数据 -> 生成配置 -> 训练 -> 出图
+    train.sh                    # 参数入口，顺序执行 corpus.py -> train.py -> plot_run.py
+    train.py                    # 平台拓扑、预算、训练配置与训练，不调用数据/绘图脚本
     plot_run.py                 # 读本地 loss 记录画曲线(单 run / 多 run 叠加)
     # run_grid.py               # (阶段 3 再写) 批量执行 + 断点续跑
     # fit_scaling.py            # (阶段 4 再写) 抛物线拟合 + 幂律拟合
@@ -400,6 +401,65 @@ ScalingLaw/
 每个 run 的 `runs/<名>/data/raw/*.parquet` 也是软链接，指向 open_source 里的语料。
 
 ## 8. 环境与运行
+
+### 训练参数入口与分布式环境
+
+修改 `scripts/train.sh` 顶部的参数，再执行 `bash scripts/train.sh`。参数也可用同名
+环境变量覆盖；`TOKENS` 与 `RATIO` 二选一。额外 CLI 参数可以追加在命令末尾：
+
+```bash
+# 只核对预算，不准备数据、不启动训练
+bash scripts/train.sh --dry-run
+# 覆盖模型、预算、学习率与 run 名
+MODEL=models/configs/pythia-86m TOKENS=1.5e9 LR=3e-4 RUN_NAME=86m-d1.5b bash scripts/train.sh
+```
+
+三个 Python 脚本独立运行，不互相导入。Shell 先用 `train.py --dry-run` 预览预算，
+再把 JSON 通过标准输入交给 `corpus.py`，按实际取整后的 token 数准备数据。
+正式步骤为 `corpus.py` → `train.py` → `plot_run.py`，任一步失败即停止。
+`--dry-run` 只预览预算，不执行这三个正式步骤。
+
+```bash
+# 单独准备数据，随后训练和出图（可使用已有的数据目录跳过第一步）
+python scripts/corpus.py --tokens 1e8 --data-dir runs/example/data --dataset fineweb_example --seed-name example
+python scripts/train.py --model models/configs/pythia-14m --tokens 1e8 --name example
+python scripts/plot_run.py runs/example
+```
+
+平台的机器信息从环境变量读取，不需要写死在 sh 中。默认使用**节点口径**：
+
+| 环境变量 | 含义 | 未设置时 |
+|---|---|---|
+| `RANK` | 本节点编号，从 0 开始 | 0 |
+| `WORLD_SIZE` | 节点总数 | 1 |
+| `NPROC_PER_NODE` | 每节点训练进程数，通常等于 GPU 数 | 本机可见 GPU 数；无 GPU 时预算预览按 1 |
+| `MASTER_ADDR` | 主节点地址 | 单节点为 127.0.0.1；多节点必须设置 |
+| `MASTER_PORT` | 所有节点使用同一通信端口 | 29500 |
+
+预算中的全局 `world_size = WORLD_SIZE × NPROC_PER_NODE`。例如 2 个节点、每节点
+4 卡，则每步 token 数为 `seq × batch × grad_accum × 8`。
+Python 把节点信息转换为 LLaMA-Factory 的 `NNODES`、`NODE_RANK`、`NPROC_PER_NODE`，
+强制使用 torchrun，训练 worker 的全局 `RANK`/`WORLD_SIZE` 由 torchrun 重新赋值。
+
+```bash
+# 示例：平台通常已注入这些变量；在每台节点执行同一脚本，RANK 分别为 0 / 1
+RANK=0 WORLD_SIZE=2 NPROC_PER_NODE=4 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 \
+  RUN_NAME=14m-two-nodes bash scripts/train.sh --dry-run
+```
+
+若平台的 `WORLD_SIZE` 是**全局进程数**，设置 `WORLD_SIZE_UNIT=processes`；此时
+`RANK` 应为本节点首个进程的全局编号（2 节点 × 4 卡的启动编号为 0 / 4），
+节点数由 `WORLD_SIZE / NPROC_PER_NODE` 推导。两种口径都要求**每节点执行一次 sh**，
+不要再通过 torchrun 启动 `train.py`，以免嵌套启动。
+原 `--world-size` 仍表示全局进程总数；有平台配置时必须与推导值一致。
+
+多节点必须共享仓库、语料和 `RUN_ROOT` 的相同绝对路径，使用相同实验参数及新的
+`RUN_NAME`（不支持多节点 `--allow-reuse`）。Shell 仅在节点 0 执行数据准备和出图；
+`train.py` 仅在节点 0 检查已有数据、生成训练配置；
+其他节点等待 `runs/<名>/launch.json`，核对参数后启动本机训练。
+每次 `budget.json` 会记录解析后的拓扑；其他节点日志写到 `train.node-<编号>.log`。
+等待配置超时默认 1800 秒，可用 `--config-wait-timeout` 调整。
+默认 warmup 不会超过训练步数；显式设置时必须满足 `0 <= warmup_steps < steps`。
 
 **结论（2026-09-24）：不建独立环境，直接用平台自带的 `/usr/bin/python3`。**
 下面这套是平台镜像配额配好的，**自洽且已验证可训** —— 不需要 conda，也**不要重装/升级任何包**。
@@ -477,7 +537,7 @@ transformers** —— 那会把 torch/accelerate 一起拖下水。需要时用 
 
 ## 9. 一次实验的产物说明（`runs/<run 名>/`）
 
-`train_abl.py` 跑完一个 run 后，产物落在 `runs/<run 名>/` 下。**每个 run 自带全部证据**，
+`train.sh` 执行完三个独立步骤后，产物落在 `runs/<run 名>/` 下。**每个 run 自带全部证据**，
 事后不用回忆当时怎么跑的。
 
 ### 9.1 我们生成的（复现与口径的依据）
@@ -487,6 +547,7 @@ transformers** —— 那会把 torch/accelerate 一起拖下水。需要时用 
 | `train.yaml` | 完整的 LLaMA-Factory 配置 | **可直接重跑**；也是"当时到底用了什么超参"的唯一权威 |
 | `budget.json` | `N_total`/`N_nonemb`/`D`/`C_total`/`C_nonemb`/`tokens_per_step`/`steps`/两种 tok-per-param | **阶段 4 拟合的输入**——横轴 `C` 和纵轴 `loss` 都从这里取 |
 | `data/dataset_info.json` | 本次语料的数据集配置（`columns.prompt=text` 等） | 记录数据是怎么接进去的 |
+| `data/corpus.json` | 数据准备记录：分片名称、起点、可用 token 数 | 由 `corpus.py` 写入；训练读取后检查数据是否足够 |
 | `data/raw/shard_NNNN.parquet` | **软链接**，指向 `open_source/.../100BT/` 里的真实分片 | 记录"这次到底喂了哪些分片"；不拷贝，282G 语料只存一份 |
 | `loss.png` | loss-vs-step + loss-vs-tokens 双面板曲线 | 一眼看收敛形状 |
 | `summary.json` | 首/末/尾部均值/最小 loss、`N`/`D`/两种 `C` | 阶段 4 汇总时不用重读 parquet |
@@ -511,7 +572,8 @@ LlaMA-Factory **没有任何开关能跳过存权重**（`pt/workflow.py:64` 的
 是无条件调用，且未 override HF 原生实现）。而本实验只需要 **loss-vs-C**，权重完全用不上，
 14m 就要 54M、1.2b 要 4.8G —— 配额只剩几百 M，不删必然撑爆。
 
-所以 `train_abl.prune_run_artifacts()` 在**出图之后**清掉与缩放律无关的大件：
+所以 `train.prune_run_artifacts()` 在**训练结束时**清掉与缩放律无关的大件，
+保留原始 loss 日志；Shell 随后独立运行 `plot_run.py` 生成曲线与摘要：
 
 | 删掉 | 为什么不需要 |
 |---|---|
@@ -545,7 +607,7 @@ LlaMA-Factory **没有任何开关能跳过存权重**（`pt/workflow.py:64` 的
 ### 9.5 ⚠️ 算力口径：**全部由我们自己算**，不信任库给的数
 
 **坑 1：`tokens_per_step` 必须乘 `world_size`。** 漏掉 GPU 数会让实际 `D` 只有预期的
-1/4，isoFLOP 剖面直接废掉。已在 `train_abl.plan_budget` 里固定。
+1/4，isoFLOP 剖面直接废掉。已在 `train.plan_budget` 里固定。
 
 **坑 2：HF 的 `total_flos` 不能当成 `C = 6ND` 用，所以干脆不用它。**
 实测（transformers 5.8.0，`trainer.py:3900`）HF 的口径是：
@@ -575,7 +637,7 @@ embedding，LM head 仍被算进去**。实测：
 从 14m 到 1.2b 差 **1.7 倍**。若拿它当横轴 `C`，小模型会被系统性压向一侧，**直接扭曲
 拟合出的指数 `a`** —— 且因为是尺寸相关的偏差、不是常数偏移，很难事后发现。
 
-**对策**：`train_abl.param_counts()` 直接按公式从 `config.json` 拆参数
+**对策**：`train.param_counts()` 直接按公式从 `config.json` 拆参数
 （`N_非emb = 12Ld² + 13Ld + 2d`，`N_总 = N_非emb + 2·vocab·d`），
 `plan_budget()` 据此算出**两个**算力口径写进 `budget.json`：
 
@@ -589,8 +651,8 @@ flops_nonemb = 6·N_nonemb·D    ← 对照口径（排除 embedding），只做
 `budget.json` 取口径，绝不读 `train_results.json` 的 `total_flos`。
 
 **所以横轴一律用 `budget.json` 里的 `flops`（= `6·N_total·D`，论文口径，见 §3.3）。**
-`train_abl.log_flops_calibers()` 每次 run 都会把两个口径的比值打出来（实测比值与预测
-`1 − vocab·d/N_total` 完全吻合），并与 HF 的 `total_flos` 对照，便于发现上游行为变化。
+`train.log_flops_calibers()` 每次 run 打印两个算力口径，并与 HF 的 `total_flos`
+对照；后者不参与预算或拟合。
 
 ## 10. 关键参考
 
